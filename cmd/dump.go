@@ -2,6 +2,7 @@ package cmd
 
 import (
 	"fmt"
+	"os"
 	"time"
 
 	"dbtool/internal/config"
@@ -9,6 +10,8 @@ import (
 	"dbtool/internal/driver/postgres"
 	"dbtool/internal/history"
 
+	"github.com/gen2brain/beeep"
+	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 )
 
@@ -91,17 +94,41 @@ var dumpCmd = &cobra.Command{
 			return err
 		}
 
+		var bar *progressbar.ProgressBar
+		if !Quiet && !Verbose {
+			bar = progressbar.NewOptions(100,
+				progressbar.OptionSetDescription("Dumping database"),
+				progressbar.OptionSetWriter(os.Stdout),
+				progressbar.OptionSetWidth(15),
+				progressbar.OptionThrottle(100*time.Millisecond),
+				progressbar.OptionShowCount(),
+				progressbar.OptionOnCompletion(func() {
+					fmt.Println()
+				}),
+			)
+		}
+
 		fmt.Printf("Starting dump of CSDL '%s' on %s:%d...\n", profile.Database, profile.Host, profile.Port)
 		var lastProgress driver.Progress
 		for p := range progressChan {
 			lastProgress = p
 			if !Quiet {
 				if Verbose || p.Err != nil || p.Percent == 100 {
+					if bar != nil {
+						_ = bar.Clear()
+					}
 					fmt.Println(p.Message)
 				} else {
-					fmt.Printf("\r%-100s", p.Message)
+					if bar != nil {
+						_ = bar.Set(int(p.Percent))
+					} else {
+						fmt.Printf("\r%-100s", p.Message)
+					}
 				}
 			}
+		}
+		if bar != nil {
+			_ = bar.Finish()
 		}
 		fmt.Println()
 
@@ -136,8 +163,10 @@ var dumpCmd = &cobra.Command{
 		_ = history.AppendHistory(historyRec)
 
 		if lastProgress.Err != nil {
+			_ = beeep.Notify("DBTool Dump Failed", fmt.Sprintf("Profile: %s\nError: %v", profile.Name, lastProgress.Err), "")
 			return lastProgress.Err
 		}
+		_ = beeep.Notify("DBTool Dump Success", fmt.Sprintf("Database %s dumped to %s", profile.Database, filePath), "")
 
 		fmt.Println("✓ Database dump completed successfully.")
 		return nil

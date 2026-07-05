@@ -13,19 +13,22 @@ import (
 	"dbtool/internal/history"
 	"dbtool/internal/safety"
 
+	"github.com/gen2brain/beeep"
+	"github.com/schollz/progressbar/v3"
 	"github.com/spf13/cobra"
 )
 
 var (
-	restoreProfile   string
-	restoreFormat    string
-	restoreJobs      int
-	restoreClean     bool
-	restoreDryRun    bool
-	includeTable     []string
-	excludeTable     []string
-	includeSchema    []string
-	excludeSchema    []string
+	restoreProfile         string
+	restoreFormat          string
+	restoreJobs            int
+	restoreClean           bool
+	restoreDryRun          bool
+	restoreCreateIfMissing bool
+	includeTable           []string
+	excludeTable           []string
+	includeSchema          []string
+	excludeSchema          []string
 )
 
 var restoreCmd = &cobra.Command{
@@ -94,16 +97,17 @@ var restoreCmd = &cobra.Command{
 		}
 
 		opts := driver.RestoreOptions{
-			Profile:       profile,
-			FilePath:      filePath,
-			Format:        finalFormat,
-			Jobs:          restoreJobs,
-			Clean:         restoreClean,
-			IncludeTable:  includeTable,
-			ExcludeTable:  excludeTable,
-			IncludeSchema: includeSchema,
-			ExcludeSchema: excludeSchema,
-			DryRun:        restoreDryRun,
+			Profile:         profile,
+			FilePath:        filePath,
+			Format:          finalFormat,
+			Jobs:            restoreJobs,
+			Clean:           restoreClean,
+			IncludeTable:    includeTable,
+			ExcludeTable:    excludeTable,
+			IncludeSchema:   includeSchema,
+			ExcludeSchema:   excludeSchema,
+			DryRun:          restoreDryRun,
+			CreateIfMissing: restoreCreateIfMissing,
 		}
 
 		cmdString := getDryRunCommand(opts)
@@ -134,6 +138,14 @@ var restoreCmd = &cobra.Command{
 			fmt.Printf("Clean:       %s\n", cleanStr)
 			fmt.Println("\n(Không có gì được thực thi. Bỏ --dry-run để chạy thật.)")
 			return nil
+		}
+
+		// 6.5 Ensure database exists if requested
+		if restoreCreateIfMissing && !restoreDryRun {
+			fmt.Printf("Checking and ensuring target database '%s' exists...\n", profile.Database)
+			if err := drv.EnsureDatabaseExists(cmd.Context(), profile); err != nil {
+				return fmt.Errorf("failed to ensure database existence: %w", err)
+			}
 		}
 
 		// 7. Safety Validation
@@ -168,18 +180,41 @@ var restoreCmd = &cobra.Command{
 			return err
 		}
 
+		var bar *progressbar.ProgressBar
+		if !Quiet && !Verbose {
+			bar = progressbar.NewOptions(100,
+				progressbar.OptionSetDescription("Restoring database"),
+				progressbar.OptionSetWriter(os.Stdout),
+				progressbar.OptionSetWidth(15),
+				progressbar.OptionThrottle(100*time.Millisecond),
+				progressbar.OptionShowCount(),
+				progressbar.OptionOnCompletion(func() {
+					fmt.Println()
+				}),
+			)
+		}
+
 		fmt.Println("Starting restore operation...")
 		var lastProgress driver.Progress
 		for p := range progressChan {
 			lastProgress = p
 			if !Quiet {
 				if Verbose || p.Err != nil || strings.Contains(p.Message, "[Database Error]") || p.Percent == 100 {
+					if bar != nil {
+						_ = bar.Clear()
+					}
 					fmt.Println(p.Message)
 				} else {
-					// Output only clean and concise progress lines
-					fmt.Printf("\r%-100s", p.Message)
+					if bar != nil {
+						_ = bar.Set(int(p.Percent))
+					} else {
+						fmt.Printf("\r%-100s", p.Message)
+					}
 				}
 			}
+		}
+		if bar != nil {
+			_ = bar.Finish()
 		}
 		fmt.Println()
 
@@ -196,9 +231,12 @@ var restoreCmd = &cobra.Command{
 		}
 		_ = history.AppendHistory(historyRec)
 
+		// Desktop Notification
 		if lastProgress.Err != nil {
+			_ = beeep.Notify("DBTool Restore Failed", fmt.Sprintf("Profile: %s\nError: %v", profile.Name, lastProgress.Err), "")
 			return lastProgress.Err
 		}
+		_ = beeep.Notify("DBTool Restore Success", fmt.Sprintf("Database %s restored successfully", profile.Database), "")
 
 		fmt.Println("✓ Database restore completed successfully.")
 		return nil
@@ -232,18 +270,7 @@ func defaultJobs() int {
 	return n
 }
 
-func formatBytes(b int64) string {
-	const unit = 1000
-	if b < unit {
-		return fmt.Sprintf("%d B", b)
-	}
-	div, exp := int64(unit), 0
-	for n := b / unit; n >= unit; n /= unit {
-		div *= unit
-		exp++
-	}
-	return fmt.Sprintf("%.1f %cB", float64(b)/float64(div), "kMGTPE"[exp])
-}
+
 
 func getDryRunCommand(opts driver.RestoreOptions) string {
 	if opts.Format == driver.FormatPlain {
@@ -281,6 +308,7 @@ func init() {
 	restoreCmd.Flags().IntVarP(&restoreJobs, "jobs", "j", defaultJobs(), "Number of parallel restore jobs")
 	restoreCmd.Flags().BoolVar(&restoreClean, "clean", false, "Clean (drop) database objects before recreating")
 	restoreCmd.Flags().BoolVar(&restoreDryRun, "dry-run", false, "Show details and the native command that would run")
+	restoreCmd.Flags().BoolVar(&restoreCreateIfMissing, "create-if-missing", false, "Create the target database if it does not exist")
 	restoreCmd.Flags().StringSliceVar(&includeTable, "include-table", nil, "Restore specific table (can be repeated)")
 	restoreCmd.Flags().StringSliceVar(&excludeTable, "exclude-table", nil, "Exclude specific table (can be repeated)")
 	restoreCmd.Flags().StringSliceVar(&includeSchema, "include-schema", nil, "Restore specific schema (can be repeated)")

@@ -40,11 +40,17 @@ dbtool [command]
 
 Lệnh khả dụng:
   profile     Quản lý profile kết nối CSDL
+    add       Thêm profile mới
+    list      Liệt kê profile đã có
+    init      Tự động phát hiện kết nối từ file cấu hình dự án
   dump        Sao lưu CSDL ra file dump
   restore     Khôi phục CSDL từ file dump
   inspect     Kiểm tra nội dung file dump (danh sách bảng, view)
   history     Xem lịch sử thao tác dump/restore
   doctor      Kiểm tra cấu hình và kết nối hệ thống
+  cache       Quản lý cache nội bộ
+    list      Liệt kê namespace và kích thước cache
+    clear     Xóa cache (toàn bộ hoặc theo namespace)
 
 Global flags:
   -q, --quiet            Tắt các output tiến trình, chỉ hiển thị lỗi
@@ -97,6 +103,25 @@ NAME                 DRIVER     HOST:PORT                 USER            DATABA
 local-dev            postgres   localhost:5432            postgres        myapp_dev
 staging              postgres   10.0.0.5:5432             appuser         myapp_staging
 ```
+
+**Tự động nhận diện kết nối từ file cấu hình dự án (`profile init`):**
+
+Nếu dự án của bạn là Spring Boot, dbtool có thể quét `application.yml` / `application.properties` và tự động tạo profile:
+
+```bash
+# Quét thư mục hiện tại
+dbtool profile init
+
+# Quét thư mục cụ thể
+dbtool profile init --from ./backend
+```
+
+dbtool sẽ:
+1. Tìm tất cả file `application*.yml` và `application*.properties`
+2. Đọc `spring.datasource.url`, `username`, `password`
+3. Giải mã JDBC URL (hỗ trợ `jdbc:postgresql://`, `jdbc:mysql://`)
+4. Tự động giải `${ENV_VAR}` và `${ENV_VAR:default}` từ biến môi trường
+5. Hỏi xác nhận và đặt tên trước khi lưu
 
 ---
 
@@ -197,6 +222,7 @@ dbtool restore [file_or_directory] --profile <tên-profile> [flags]
 | `--format` | Định dạng file: `auto`, `custom`, `plain`, `directory` | `auto` |
 | `-j, --jobs` | Số luồng restore song song (chỉ áp dụng cho định dạng `directory`) | số CPU |
 | `--clean` | Xóa các object cũ trong DB trước khi restore |  `false` |
+| `--create-if-missing` | Tự động tạo CSDL đích nếu chưa tồn tại | `false` |
 | `--dry-run` | Hiển thị lệnh sẽ chạy mà không thực thi | `false` |
 | `--include-table` | Chỉ restore bảng chỉ định (có thể lặp) | — |
 | `--exclude-table` | Bỏ qua bảng chỉ định khi restore (có thể lặp) | — |
@@ -214,6 +240,9 @@ dbtool restore ./backups/myapp.tar --profile local-dev --dry-run
 
 # Restore và xóa sạch dữ liệu cũ trước
 dbtool restore ./backups/myapp.tar --profile local-dev --clean
+
+# Restore và tự động tạo CSDL nếu chưa tồn tại
+dbtool restore ./backups/myapp.tar --profile local-dev --create-if-missing
 
 # Restore với nhiều luồng song song (định dạng directory)
 dbtool restore ./backups/myapp_dir --profile local-dev --jobs 8
@@ -297,6 +326,23 @@ DBTool Doctor Report:
 
 ---
 
+### 7. Quản lý cache (`cache`)
+
+dbool lưu cache kết quả phân tích file dump (TOC, định dạng) để tăng tốc các lần chạy sau.
+
+```bash
+# Xem các namespace và kích thước cache
+dbtool cache list
+
+# Xóa toàn bộ cache
+dbtool cache clear
+
+# Xóa cache của namespace cụ thể (vd: toc)
+dbtool cache clear --namespace toc
+```
+
+---
+
 ## Cấu trúc dự án
 
 ```
@@ -305,15 +351,19 @@ dbtool/
 ├── cmd/
 │   ├── root.go                     # Root command & global flags
 │   ├── profile.go                  # `profile add` / `profile list`
+│   ├── profile_init.go             # `profile init` (tự động nhận diện kết nối)
 │   ├── dump.go                     # `dump`
 │   ├── restore.go                  # `restore`
 │   ├── inspect.go                  # `inspect`
 │   ├── history.go                  # `history`
+│   ├── cache.go                    # `cache list` / `cache clear`
 │   └── doctor.go                   # `doctor`
 └── internal/
     ├── config/                     # Đọc/ghi profiles.yaml
     ├── driver/                     # Interface Driver và registry
     │   └── postgres/               # PostgreSQL driver implementation
+    ├── importer/                   # Interface Importer và registry
+    │   └── springboot/             # Spring Boot config importer
     ├── history/                    # Ghi/đọc lịch sử thao tác (history.jsonl)
     ├── cache/                      # Cache kết quả phát hiện định dạng
     ├── safety/                     # Kiểm tra CSDL đích trước khi ghi đè

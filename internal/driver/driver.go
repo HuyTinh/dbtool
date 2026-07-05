@@ -23,16 +23,17 @@ type Progress struct {
 }
 
 type RestoreOptions struct {
-	Profile       config.Profile
-	FilePath      string
-	Format        Format
-	Jobs          int
-	Clean         bool
-	IncludeTable  []string
-	ExcludeTable  []string
-	IncludeSchema []string
-	ExcludeSchema []string
-	DryRun        bool
+	Profile         config.Profile
+	FilePath        string
+	Format          Format
+	Jobs            int
+	Clean           bool
+	IncludeTable    []string
+	ExcludeTable    []string
+	IncludeSchema   []string
+	ExcludeSchema   []string
+	DryRun          bool
+	CreateIfMissing bool
 }
 
 type DumpOptions struct {
@@ -68,4 +69,5 @@ type Driver interface {
 	Dump(ctx context.Context, opts DumpOptions) (<-chan Progress, error)
 	TestConnection(ctx context.Context, profile config.Profile) error // takes ctx to support timeout
 	Doctor(profile *config.Profile) []DoctorCheck                     // profile == nil: check binaries/global, profile != nil: check connection as well
+	EnsureDatabaseExists(ctx context.Context, profile config.Profile) error
 }

@@ -9,11 +9,16 @@ import (
 	"os"
 	"os/exec"
 	"runtime/debug"
+	"strings"
 	"sync"
 	"time"
 
+	"dbtool/internal/cache"
+	"dbtool/internal/config"
 	"dbtool/internal/driver"
 	"dbtool/internal/procutil"
+
+	"github.com/jackc/pgx/v5"
 )
 
 func (d *PostgresDriver) Restore(ctx context.Context, opts driver.RestoreOptions) (<-chan driver.Progress, error) {
@@ -44,6 +49,11 @@ func (d *PostgresDriver) Restore(ctx context.Context, opts driver.RestoreOptions
 		return nil, fmt.Errorf("failed to start process: %w", err)
 	}
 
+	totalTOC := 0
+	if opts.Format == driver.FormatCustom || opts.Format == driver.FormatDirectory {
+		totalTOC = d.countTOC(opts.FilePath)
+	}
+
 	progressChan := make(chan driver.Progress, 100)
 	go func() {
 		defer close(progressChan)
@@ -53,12 +63,12 @@ func (d *PostgresDriver) Restore(ctx context.Context, opts driver.RestoreOptions
 
 		go func() {
 			defer wg.Done()
-			scanStream(stdout, progressChan, false)
+			scanStream(stdout, progressChan, false, 0, false)
 		}()
 
 		go func() {
 			defer wg.Done()
-			scanStream(stderr, progressChan, true)
+			scanStream(stderr, progressChan, true, totalTOC, false)
 		}()
 
 		wg.Wait()
@@ -110,6 +120,8 @@ func (d *PostgresDriver) Dump(ctx context.Context, opts driver.DumpOptions) (<-c
 		return nil, fmt.Errorf("failed to start process: %w", err)
 	}
 
+	totalTables := countSourceTables(ctx, opts.Profile)
+
 	progressChan := make(chan driver.Progress, 100)
 	go func() {
 		defer close(progressChan)
@@ -119,12 +131,12 @@ func (d *PostgresDriver) Dump(ctx context.Context, opts driver.DumpOptions) (<-c
 
 		go func() {
 			defer wg.Done()
-			scanStream(stdout, progressChan, false)
+			scanStream(stdout, progressChan, false, 0, true)
 		}()
 
 		go func() {
 			defer wg.Done()
-			scanStream(stderr, progressChan, true)
+			scanStream(stderr, progressChan, true, totalTables, true)
 		}()
 
 		wg.Wait()
@@ -223,7 +235,7 @@ func buildDumpArgs(opts driver.DumpOptions) (string, []string) {
 	return "pg_dump", args
 }
 
-func scanStream(r io.Reader, out chan driver.Progress, isStderr bool) {
+func scanStream(r io.Reader, out chan driver.Progress, isStderr bool, totalCount int, isDump bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("panic in scanStream (isStderr=%v): %v\n%s", isStderr, r, debug.Stack())
@@ -233,14 +245,130 @@ func scanStream(r io.Reader, out chan driver.Progress, isStderr bool) {
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	
+	processed := 0
 	for scanner.Scan() {
 		line := scanner.Text()
+		var p driver.Progress
 		if isStderr {
-			sendProgress(out, classifyStderrLine(line))
+			p = classifyStderrLine(line)
+			if !isDump && totalCount > 0 && isPgRestoreVerboseLine(line) {
+				processed++
+				p.Percent = (float64(processed) / float64(totalCount)) * 100
+				if p.Percent >= 100.0 {
+					p.Percent = 99.0
+				}
+			}
+			if isDump && totalCount > 0 && isPgDumpVerboseLine(line) {
+				processed++
+				p.Percent = (float64(processed) / float64(totalCount)) * 100
+				if p.Percent >= 100.0 {
+					p.Percent = 99.0
+				}
+			}
 		} else {
-			sendProgress(out, parseLine(line))
+			p = parseLine(line)
 		}
+		sendProgress(out, p)
 	}
+}
+
+func isPgRestoreVerboseLine(line string) bool {
+	line = strings.ToLower(strings.TrimSpace(line))
+	if !strings.HasPrefix(line, "pg_restore:") {
+		return false
+	}
+	if strings.Contains(line, "warning:") || strings.Contains(line, "error:") {
+		return false
+	}
+	return strings.Contains(line, "creating") ||
+		strings.Contains(line, "processing") ||
+		strings.Contains(line, "setting") ||
+		strings.Contains(line, "dropping") ||
+		strings.Contains(line, "refreshing")
+}
+
+func isPgDumpVerboseLine(line string) bool {
+	line = strings.ToLower(strings.TrimSpace(line))
+	if !strings.HasPrefix(line, "pg_dump:") {
+		return false
+	}
+	if strings.Contains(line, "warning:") || strings.Contains(line, "error:") {
+		return false
+	}
+	return strings.Contains(line, "dumping contents of table") ||
+		strings.Contains(line, "dumping database") ||
+		strings.Contains(line, "saving database definition")
+}
+
+func countTOCEntries(filePath string) (int, error) {
+	binary := "pg_restore"
+	if _, err := exec.LookPath(binary); err != nil {
+		return 0, err
+	}
+	cmd := exec.Command(binary, "-l", filePath)
+	out, err := cmd.Output()
+	if err != nil {
+		return 0, err
+	}
+	scanner := bufio.NewScanner(strings.NewReader(string(out)))
+	count := 0
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" || strings.HasPrefix(line, ";") {
+			continue
+		}
+		count++
+	}
+	return count, nil
+}
+
+func (d *PostgresDriver) countTOC(filePath string) int {
+	if d.cache == nil {
+		count, _ := countTOCEntries(filePath)
+		return count
+	}
+	fp, err := cache.ComputeFingerprint(filePath)
+	if err != nil {
+		return 0
+	}
+	var cachedCount int
+	ok, _ := d.cache.Get("toc", fp.Key(), &cachedCount)
+	if ok {
+		return cachedCount
+	}
+	count, err := countTOCEntries(filePath)
+	if err != nil {
+		return 0
+	}
+	_ = d.cache.Set("toc", fp.Key(), filePath, count, 30*24*time.Hour)
+	return count
+}
+
+func countSourceTables(ctx context.Context, profile config.Profile) int {
+	dsn := fmt.Sprintf(
+		"postgres://%s:%s@%s:%d/%s?connect_timeout=3",
+		profile.User, profile.Password, profile.Host, profile.Port, profile.Database,
+	)
+	ctx, cancel := context.WithTimeout(ctx, 3*time.Second)
+	defer cancel()
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return 0
+	}
+	defer conn.Close(ctx)
+	var count int
+	query := `
+		SELECT count(*) 
+		FROM information_schema.tables 
+		WHERE table_schema NOT IN ('pg_catalog', 'information_schema') 
+		  AND table_schema NOT LIKE 'pg_toast%'
+	`
+	err = conn.QueryRow(ctx, query).Scan(&count)
+	if err != nil {
+		return 0
+	}
+	return count
 }
 
 func sendProgress(out chan driver.Progress, p driver.Progress) {
