@@ -1,0 +1,40 @@
+# Build output
+dbtool
+dbtool.exe
+*.exe
+*.out
+
+# Go workspace (nếu dùng go work)
+go.work
+go.work.sum
+
+# Test binary
+*.test
+
+# Test coverage output
+*.coverprofile
+coverage.html
+
+# macOS
+.DS_Store
+
+# Windows
+Thumbs.db
+
+# IDE / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Dữ liệu nhạy cảm — KHÔNG đẩy lên Git
+profiles.yaml
+*.yaml
+*.env
+.env*
+
+# File dump CSDL
+*.tar
+*.sql
+*.dump
+*.backup
