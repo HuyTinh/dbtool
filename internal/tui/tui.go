@@ -22,6 +22,7 @@ type RestoreSettings struct {
 	Clean           bool
 	DryRun          bool
 	CreateIfMissing bool
+	Optimize        bool
 	IncludeTable    []string
 	ExcludeTable    []string
 	IncludeSchema   []string
@@ -45,6 +46,7 @@ type MigrateSettings struct {
 	Clean           bool
 	CreateIfMissing bool
 	Jobs            int
+	Optimize        bool
 	IncludeTable    []string
 	ExcludeTable    []string
 	IncludeSchema   []string

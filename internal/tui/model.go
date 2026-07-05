@@ -560,6 +560,8 @@ func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.result.Settings.Clean = !m.result.Settings.Clean
 	case "m", "M":
 		m.result.Settings.CreateIfMissing = !m.result.Settings.CreateIfMissing
+	case "o", "O":
+		m.result.Settings.Optimize = !m.result.Settings.Optimize
 	case "+", "=":
 		m.result.Settings.Jobs++
 	case "-":
@@ -862,9 +864,15 @@ func (m Model) viewConfirm() string {
 		createDbVal = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("Yes (create DB if missing)")
 	}
 
+	optimizeVal := lipgloss.NewStyle().Foreground(colorMuted).Render("No")
+	if s.Optimize {
+		optimizeVal = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("Yes (VACUUM ANALYZE after restore)")
+	}
+
 	settingsRows := []struct{ label, value string }{
 		{"[c] Clean", cleanVal},
 		{"[m] Create DB", createDbVal},
+		{"[o] Optimize", optimizeVal},
 		{"[+/-] Jobs", fmt.Sprintf("%d parallel processes", s.Jobs)},
 		{"Format", s.Format},
 	}
@@ -894,7 +902,7 @@ func (m Model) viewConfirm() string {
 		"  ! Press Enter to execute database restoration.\n"))
 	sb.WriteString("\n")
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  [c] toggle clean   [m] toggle create-db   [+/-] jobs   [Enter] proceed   [esc] back\n"))
+		"  [c] toggle clean   [m] toggle create-db   [o] toggle optimize   [+/-] jobs   [Enter] proceed   [esc] back\n"))
 	return sb.String()
 }
 
@@ -1260,6 +1268,14 @@ func (m *Model) finalizeRestore(err error) {
 		_ = beeep.Notify("DBTool Restore Failed", fmt.Sprintf("Profile: %s\nError: %v", m.result.Profile.Name, err), "")
 	} else {
 		_ = beeep.Notify("DBTool Restore Success", fmt.Sprintf("Database %s restored successfully", m.result.Profile.Database), "")
+
+		// Post-restore optimization
+		if m.result.Settings.Optimize {
+			optDrv, _ := driver.Get(m.result.Profile.Driver)
+			if optErr := optDrv.Optimize(context.Background(), m.result.Profile); optErr != nil {
+				_ = beeep.Notify("DBTool Optimization Warning", fmt.Sprintf("Restore succeeded but optimization failed: %v", optErr), "")
+			}
+		}
 	}
 }
 
@@ -1811,6 +1827,8 @@ func (m Model) updateMigrateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.result.MigrateSettings.DataOnly {
 			m.result.MigrateSettings.SchemaOnly = false
 		}
+	case "o", "O":
+		m.result.MigrateSettings.Optimize = !m.result.MigrateSettings.Optimize
 	}
 	return m, nil
 }
@@ -1855,10 +1873,16 @@ func (m Model) viewMigrateConfirm() string {
 		modeVal = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("data-only")
 	}
 
+	optimizeVal := lipgloss.NewStyle().Foreground(colorMuted).Render("No")
+	if s.Optimize {
+		optimizeVal = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("Yes (VACUUM ANALYZE)")
+	}
+
 	rows := []struct{ label, value string }{
 		{"[c] Clean", cleanVal},
 		{"[m] Create DB", createDbVal},
 		{"[s/a] Mode", modeVal},
+		{"[o] Optimize", optimizeVal},
 		{"Jobs", fmt.Sprintf("%d", s.Jobs)},
 		{"Format", s.Format},
 	}
@@ -1873,7 +1897,7 @@ func (m Model) viewMigrateConfirm() string {
 		"  ! Press Enter to migrate (target may be overwritten).\n"))
 	sb.WriteString("\n")
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  [c] clean   [m] create-db   [s] schema-only   [a] data-only   [Enter] proceed   [esc] back\n"))
+		"  [c] clean   [m] create-db   [s] schema-only   [a] data-only   [o] optimize   [Enter] proceed   [esc] back\n"))
 	return sb.String()
 }
 
@@ -2035,6 +2059,14 @@ func (m *Model) finalizeMigrate(err error) {
 		_ = beeep.Notify("DBTool Migrate Failed", fmt.Sprintf("%s -> %s: %v", src.Name, dst.Name, err), "")
 	} else {
 		_ = beeep.Notify("DBTool Migrate Success", fmt.Sprintf("%s -> %s migrated", src.Database, dst.Database), "")
+
+		// Post-migrate optimization on target
+		if m.result.MigrateSettings.Optimize {
+			optDrv, _ := driver.Get(dst.Driver)
+			if optErr := optDrv.Optimize(context.Background(), dst); optErr != nil {
+				_ = beeep.Notify("DBTool Optimization Warning", fmt.Sprintf("Migration succeeded but optimization failed: %v", optErr), "")
+			}
+		}
 	}
 }
 

@@ -26,6 +26,7 @@ var (
 	migrateCreateIfMissing bool
 	migrateJobs            int
 	migrateKeepTemp        bool
+	migrateOptimize        bool
 	migrateIncludeTable    []string
 	migrateExcludeTable    []string
 	migrateIncludeSchema   []string
@@ -47,6 +48,7 @@ var migrateCmd = &cobra.Command{
 			CreateIfMissing: migrateCreateIfMissing,
 			Jobs:            migrateJobs,
 			KeepTemp:        migrateKeepTemp,
+			Optimize:        migrateOptimize,
 			IncludeTable:    migrateIncludeTable,
 			ExcludeTable:    migrateExcludeTable,
 			IncludeSchema:   migrateIncludeSchema,
@@ -67,6 +69,7 @@ type MigrateOptions struct {
 	CreateIfMissing bool
 	Jobs            int
 	KeepTemp        bool
+	Optimize        bool
 	IncludeTable    []string
 	ExcludeTable    []string
 	IncludeSchema   []string
@@ -301,6 +304,17 @@ func ExecuteMigrateLogic(ctx context.Context, opts MigrateOptions) error {
 
 	fmt.Println()
 	fmt.Println("✓ Migration completed successfully.")
+
+	// Post-migrate optimization on target
+	if opts.Optimize {
+		fmt.Println("Running VACUUM ANALYZE to optimize target database...")
+		if err := drv.Optimize(ctx, dst); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ Warning: optimization failed (migration was successful): %v\n", err)
+		} else {
+			fmt.Println("✓ Target database optimization completed.")
+		}
+	}
+
 	if opts.KeepTemp {
 		fmt.Printf("Temp dump kept at: %s\n", tempPath)
 	}
@@ -339,6 +353,7 @@ func init() {
 	migrateCmd.Flags().BoolVar(&migrateCreateIfMissing, "create-if-missing", false, "Create the target database if it does not exist")
 	migrateCmd.Flags().IntVarP(&migrateJobs, "jobs", "j", defaultJobs(), "Parallel restore jobs (directory format only)")
 	migrateCmd.Flags().BoolVar(&migrateKeepTemp, "keep-temp", false, "Keep the intermediate dump file after migration")
+	migrateCmd.Flags().BoolVar(&migrateOptimize, "optimize", false, "Run VACUUM ANALYZE on target after migration")
 	migrateCmd.Flags().StringSliceVar(&migrateIncludeTable, "include-table", nil, "Include specific table (can be repeated)")
 	migrateCmd.Flags().StringSliceVar(&migrateExcludeTable, "exclude-table", nil, "Exclude specific table (can be repeated)")
 	migrateCmd.Flags().StringSliceVar(&migrateIncludeSchema, "include-schema", nil, "Include specific schema (can be repeated)")

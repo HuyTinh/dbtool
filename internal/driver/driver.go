@@ -72,4 +72,5 @@ type Driver interface {
 	TestConnection(ctx context.Context, profile config.Profile) error // takes ctx to support timeout
 	Doctor(profile *config.Profile) []DoctorCheck                     // profile == nil: check binaries/global, profile != nil: check connection as well
 	EnsureDatabaseExists(ctx context.Context, profile config.Profile) error
+	Optimize(ctx context.Context, profile config.Profile) error
 }

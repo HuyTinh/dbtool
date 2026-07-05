@@ -26,6 +26,7 @@ var (
 	restoreClean           bool
 	restoreDryRun          bool
 	restoreCreateIfMissing bool
+	restoreOptimize        bool
 	includeTable           []string
 	excludeTable           []string
 	includeSchema          []string
@@ -236,6 +237,17 @@ func ExecuteRestoreLogic(ctx context.Context, filePath string) error {
 	_ = beeep.Notify("DBTool Restore Success", fmt.Sprintf("Database %s restored successfully", profile.Database), "")
 
 	fmt.Println("✓ Database restore completed successfully.")
+
+	// Post-restore optimization
+	if restoreOptimize {
+		fmt.Println("Running VACUUM ANALYZE to optimize database...")
+		if err := drv.Optimize(runCtx, profile); err != nil {
+			fmt.Fprintf(os.Stderr, "⚠ Warning: optimization failed (restore was successful): %v\n", err)
+		} else {
+			fmt.Println("✓ Database optimization completed.")
+		}
+	}
+
 	return nil
 }
 
@@ -314,6 +326,7 @@ func init() {
 	restoreCmd.Flags().BoolVar(&restoreClean, "clean", false, "Clean (drop) database objects before recreating")
 	restoreCmd.Flags().BoolVar(&restoreDryRun, "dry-run", false, "Show details and the native command that would run")
 	restoreCmd.Flags().BoolVar(&restoreCreateIfMissing, "create-if-missing", false, "Create the target database if it does not exist")
+	restoreCmd.Flags().BoolVar(&restoreOptimize, "optimize", false, "Run VACUUM ANALYZE after restore to optimize database")
 	restoreCmd.Flags().StringSliceVar(&includeTable, "include-table", nil, "Restore specific table (can be repeated)")
 	restoreCmd.Flags().StringSliceVar(&excludeTable, "exclude-table", nil, "Exclude specific table (can be repeated)")
 	restoreCmd.Flags().StringSliceVar(&includeSchema, "include-schema", nil, "Restore specific schema (can be repeated)")
