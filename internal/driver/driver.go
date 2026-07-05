@@ -40,6 +40,8 @@ type DumpOptions struct {
 	Profile       config.Profile
 	FilePath      string
 	Format        Format
+	SchemaOnly    bool
+	DataOnly      bool
 	IncludeTable  []string
 	ExcludeTable  []string
 	IncludeSchema []string

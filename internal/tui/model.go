@@ -37,6 +37,11 @@ const (
 	stepDumpConfirm
 	stepDumping
 	stepDumpResult
+	// Migrate-specific
+	stepMigrateSelectDest
+	stepMigrateConfirm
+	stepMigrating
+	stepMigrateResult
 	stepDone
 )
 
@@ -59,6 +64,10 @@ type Result struct {
 	DumpFile     string
 	DumpSettings DumpSettings
 	DumpConfirm  bool
+	// Migrate-specific
+	DestProfile     config.Profile
+	MigrateSettings MigrateSettings
+	MigrateConfirm  bool
 }
 
 // --- Main model ---
@@ -103,6 +112,15 @@ type Model struct {
 	dumpProgressText string
 	dumpErr          error
 
+	// Migrate state
+	migrateDestIdx      int
+	migrateTempPath     string
+	migratePhase        int // 0=dump, 1=restore
+	migrateProgressChan <-chan driver.Progress
+	migrateProgressPct  float64
+	migrateProgressText string
+	migrateErr          error
+
 	// Terminal size
 	width  int
 	height int
@@ -143,6 +161,7 @@ func NewModel(cfg *config.Config, initSettings RestoreSettings) Model {
 	}
 	m.result.Settings = initSettings
 	m.result.DumpSettings = DumpSettings{Format: "custom"}
+	m.result.MigrateSettings = MigrateSettings{Format: "custom", Jobs: 4}
 	m.entries = listDir(cwd)
 	return m
 }
@@ -181,6 +200,22 @@ func listenToDumpProgress(ch <-chan driver.Progress) tea.Cmd {
 	}
 }
 
+type migrateProgressMsg driver.Progress
+type migratePhaseFinishedMsg struct {
+	err   error
+	phase int // 0=dump, 1=restore
+}
+
+func listenToMigrateProgress(ch <-chan driver.Progress, phase int) tea.Cmd {
+	return func() tea.Msg {
+		p, ok := <-ch
+		if !ok {
+			return migratePhaseFinishedMsg{phase: phase}
+		}
+		return migrateProgressMsg(p)
+	}
+}
+
 // --- Update ---
 func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
@@ -214,6 +249,17 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.finalizeDump(msg.err)
 		m.step = stepDumpResult
 		return m, nil
+
+	case migrateProgressMsg:
+		m.migrateProgressPct = msg.Percent
+		m.migrateProgressText = msg.Message
+		if msg.Err != nil {
+			m.migrateErr = msg.Err
+		}
+		return m, listenToMigrateProgress(m.migrateProgressChan, m.migratePhase)
+
+	case migratePhaseFinishedMsg:
+		return m.handleMigratePhaseFinished(msg)
 
 	case tea.KeyMsg:
 		switch m.step {
@@ -253,6 +299,21 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.dumpErr = nil
 				m.dumpProgressPct = 0
 				m.dumpProgressText = ""
+				m.step = stepSelectMode
+			}
+		case stepMigrateSelectDest:
+			return m.updateMigrateDestSelector(msg)
+		case stepMigrateConfirm:
+			return m.updateMigrateConfirm(msg)
+		case stepMigrateResult:
+			switch msg.String() {
+			case "q", "ctrl+c", "esc":
+				m.step = stepDone
+				return m, tea.Quit
+			default:
+				m.migrateErr = nil
+				m.migrateProgressPct = 0
+				m.migrateProgressText = ""
 				m.step = stepSelectMode
 			}
 		}
@@ -297,6 +358,12 @@ func (m Model) updateProfileSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.dumpOutputInput.SetValue("")
 			m.dumpOutputInput.Focus()
 			m.step = stepDumpOutputPath
+		} else if m.result.Mode == ModeMigrate {
+			m.migrateDestIdx = 0
+			if m.migrateDestIdx == m.profileIdx && len(m.profiles) > 1 {
+				m.migrateDestIdx = 1
+			}
+			m.step = stepMigrateSelectDest
 		} else {
 			m.step = stepSelectFile
 		}
@@ -563,6 +630,14 @@ func (m Model) View() string {
 		return m.viewDumping()
 	case stepDumpResult:
 		return m.viewDumpResult()
+	case stepMigrateSelectDest:
+		return m.viewMigrateDestSelector()
+	case stepMigrateConfirm:
+		return m.viewMigrateConfirm()
+	case stepMigrating:
+		return m.viewMigrating()
+	case stepMigrateResult:
+		return m.viewMigrateResult()
 	}
 	return ""
 }
@@ -1004,6 +1079,11 @@ func (m Model) saveProfileForm() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if _, exists := m.cfg.Profiles[name]; exists && (!m.isEditing || name != m.origName) {
+		m.formErr = fmt.Sprintf("Profile %q already exists", name)
+		return m, nil
+	}
+
 	// Update Config
 	if m.isEditing && name != m.origName {
 		delete(m.cfg.Profiles, m.origName)
@@ -1056,7 +1136,8 @@ func (m Model) updateConfirmDelete(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m *Model) reloadProfiles() {
 	profiles := make([]config.Profile, 0, len(m.cfg.Profiles))
-	for _, p := range m.cfg.Profiles {
+	for k, p := range m.cfg.Profiles {
+		p.Name = k
 		profiles = append(profiles, p)
 	}
 	sort.Slice(profiles, func(i, j int) bool {
@@ -1272,6 +1353,13 @@ func (m Model) updateSelectMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		} else {
 			m.step = stepSelectProfile
 		}
+	case "m", "M", "3":
+		m.result.Mode = ModeMigrate
+		if m.hasActiveProfile() {
+			m.step = stepMigrateSelectDest
+		} else {
+			m.step = stepSelectProfile
+		}
 	case "p", "P":
 		if m.profileIdx >= len(m.profiles) {
 			m.profileIdx = 0
@@ -1321,8 +1409,10 @@ func (m Model) viewSelectMode() string {
 		lipgloss.NewStyle().Foreground(colorText).Render("Restore") + " — Import a dump file into a database\n\n")
 	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("  [D]  ") +
 		lipgloss.NewStyle().Foreground(colorText).Render("Dump") + "    — Export a database to a dump file\n\n")
+	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("  [M]  ") +
+		lipgloss.NewStyle().Foreground(colorText).Render("Migrate") + " — Copy a database from one profile to another\n\n")
 
-	hint := "\n  Press R or D to begin"
+	hint := "\n  Press R, D or M to begin"
 	if m.hasActiveProfile() {
 		hint += " • [p] switch profile"
 	} else {
@@ -1550,4 +1640,447 @@ func (m Model) viewDumpResult() string {
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
 		"  Press any key to do another operation • Q / Esc to quit\n"))
 	return sb.String()
+}
+
+// ─── Migrate: destination profile selector ───────────────────────────────────
+
+func (m Model) updateMigrateDestSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if len(m.profiles) == 0 {
+		switch msg.String() {
+		case "q", "ctrl+c", "esc":
+			m.step = stepSelectMode
+		}
+		return m, nil
+	}
+	switch msg.String() {
+	case "up", "k":
+		if m.migrateDestIdx > 0 {
+			m.migrateDestIdx--
+		}
+	case "down", "j":
+		if m.migrateDestIdx < len(m.profiles)-1 {
+			m.migrateDestIdx++
+		}
+	case "enter", " ":
+		candidate := m.profiles[m.migrateDestIdx]
+		if candidate.Name == m.result.Profile.Name {
+			return m, nil
+		}
+		m.result.DestProfile = candidate
+		m.step = stepMigrateConfirm
+	case "q", "ctrl+c":
+		return m, tea.Quit
+	case "esc":
+		m.step = stepSelectProfile
+	}
+	return m, nil
+}
+
+func (m Model) viewMigrateDestSelector() string {
+	var sb strings.Builder
+
+	title := lipgloss.NewStyle().
+		Foreground(colorText).
+		Background(colorPrimary).
+		Bold(true).
+		Padding(0, 2).
+		Render("dbtool — Select Destination Profile")
+	sb.WriteString(title + "\n\n")
+
+	src := m.result.Profile
+	srcBadge := renderBadge(src.Driver, "#A78BFA")
+	sb.WriteString("  Source: " +
+		lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(src.Name) + " " + srcBadge +
+		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %s:%d/%s", src.Host, src.Port, src.Database)) + "\n\n")
+
+	sb.WriteString(lipgloss.NewStyle().Foreground(colorAccent).Render("  Choose the destination profile:\n\n"))
+
+	maxNameLen := 0
+	for _, p := range m.profiles {
+		if len(p.Name) > maxNameLen {
+			maxNameLen = len(p.Name)
+		}
+	}
+	if maxNameLen < 12 {
+		maxNameLen = 12
+	}
+
+	for i, p := range m.profiles {
+		selected := i == m.migrateDestIdx
+		isSource := p.Name == src.Name
+		badge := renderBadge(p.Driver, "#A78BFA")
+		connStr := fmt.Sprintf("%s:%d/%s", p.Host, p.Port, p.Database)
+
+		namePart := fmt.Sprintf("%-*s", maxNameLen+2, p.Name)
+		if isSource {
+			namePart += lipgloss.NewStyle().Foreground(colorMuted).Render(" (source)")
+		}
+		row := renderRow(selected, namePart)
+		connPart := lipgloss.NewStyle().Foreground(colorMuted).Render(" " + connStr)
+		sb.WriteString("  " + row + " " + badge + connPart + "\n")
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
+		"  [up/down] navigate   [Enter] select   [esc] back   [q] quit\n"))
+	return sb.String()
+}
+
+// ─── Migrate: confirm ────────────────────────────────────────────────────────
+
+func (m Model) updateMigrateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	switch msg.String() {
+	case "enter", "y":
+		m.result.MigrateConfirm = true
+		src := m.result.Profile
+		dst := m.result.DestProfile
+
+		if src.Name == dst.Name {
+			m.migrateErr = fmt.Errorf("source and destination profiles must be different")
+			m.step = stepMigrateResult
+			return m, nil
+		}
+		if src.Driver != dst.Driver {
+			m.migrateErr = fmt.Errorf("cross-driver migration is not supported (source: %s, dest: %s)", src.Driver, dst.Driver)
+			m.step = stepMigrateResult
+			return m, nil
+		}
+
+		drv, err := driver.Get(src.Driver)
+		if err != nil {
+			m.migrateErr = err
+			m.step = stepMigrateResult
+			return m, nil
+		}
+
+		format := driver.Format(m.result.MigrateSettings.Format)
+		if format == "" {
+			format = driver.FormatCustom
+		}
+
+		tempPath, err := createMigrateTempPath(format)
+		if err != nil {
+			m.migrateErr = err
+			m.step = stepMigrateResult
+			return m, nil
+		}
+		m.migrateTempPath = tempPath
+
+		dumpOpts := driver.DumpOptions{
+			Profile:       src,
+			FilePath:      tempPath,
+			Format:        format,
+			SchemaOnly:    m.result.MigrateSettings.SchemaOnly,
+			DataOnly:      m.result.MigrateSettings.DataOnly,
+			IncludeTable:  m.result.MigrateSettings.IncludeTable,
+			ExcludeTable:  m.result.MigrateSettings.ExcludeTable,
+			IncludeSchema: m.result.MigrateSettings.IncludeSchema,
+			ExcludeSchema: m.result.MigrateSettings.ExcludeSchema,
+		}
+
+		ch, err := drv.Dump(context.Background(), dumpOpts)
+		if err != nil {
+			_ = os.RemoveAll(tempPath)
+			m.migrateTempPath = ""
+			m.migrateErr = err
+			m.step = stepMigrateResult
+			return m, nil
+		}
+
+		m.migrateProgressChan = ch
+		m.migratePhase = 0
+		m.migrateProgressPct = 0
+		m.migrateProgressText = "Phase 1/2: Dumping from source..."
+		m.migrateErr = nil
+		m.step = stepMigrating
+		return m, listenToMigrateProgress(ch, 0)
+
+	case "n", "q", "ctrl+c", "esc":
+		m.step = stepMigrateSelectDest
+	case "c", "C":
+		m.result.MigrateSettings.Clean = !m.result.MigrateSettings.Clean
+	case "m", "M":
+		m.result.MigrateSettings.CreateIfMissing = !m.result.MigrateSettings.CreateIfMissing
+	case "s", "S":
+		m.result.MigrateSettings.SchemaOnly = !m.result.MigrateSettings.SchemaOnly
+		if m.result.MigrateSettings.SchemaOnly {
+			m.result.MigrateSettings.DataOnly = false
+		}
+	case "a", "A":
+		m.result.MigrateSettings.DataOnly = !m.result.MigrateSettings.DataOnly
+		if m.result.MigrateSettings.DataOnly {
+			m.result.MigrateSettings.SchemaOnly = false
+		}
+	}
+	return m, nil
+}
+
+func (m Model) viewMigrateConfirm() string {
+	var sb strings.Builder
+
+	title := lipgloss.NewStyle().
+		Foreground(colorText).
+		Background(colorPrimary).
+		Bold(true).
+		Padding(0, 2).
+		Render("dbtool — Confirm Migrate")
+	sb.WriteString(title + "\n\n")
+
+	src := m.result.Profile
+	dst := m.result.DestProfile
+
+	srcBadge := renderBadge(src.Driver, "#A78BFA")
+	dstBadge := renderBadge(dst.Driver, "#A78BFA")
+
+	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Source: ") +
+		valueStyle.Render(src.Name) + " " + srcBadge +
+		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %s:%d/%s", src.Host, src.Port, src.Database)) + "\n")
+	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Target: ") +
+		valueStyle.Render(dst.Name) + " " + dstBadge +
+		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %s:%d/%s", dst.Host, dst.Port, dst.Database)) + "\n\n")
+
+	s := m.result.MigrateSettings
+	cleanVal := lipgloss.NewStyle().Foreground(colorMuted).Render("No")
+	if s.Clean {
+		cleanVal = lipgloss.NewStyle().Foreground(colorWarning).Bold(true).Render("Yes (drop objects first)")
+	}
+	createDbVal := lipgloss.NewStyle().Foreground(colorMuted).Render("No")
+	if s.CreateIfMissing {
+		createDbVal = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("Yes")
+	}
+	modeVal := lipgloss.NewStyle().Foreground(colorMuted).Render("full (schema + data)")
+	if s.SchemaOnly {
+		modeVal = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("schema-only")
+	} else if s.DataOnly {
+		modeVal = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("data-only")
+	}
+
+	rows := []struct{ label, value string }{
+		{"[c] Clean", cleanVal},
+		{"[m] Create DB", createDbVal},
+		{"[s/a] Mode", modeVal},
+		{"Jobs", fmt.Sprintf("%d", s.Jobs)},
+		{"Format", s.Format},
+	}
+	for _, row := range rows {
+		label := lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render(row.label + ":")
+		val := lipgloss.NewStyle().Foreground(colorSubtext).Render(row.value)
+		sb.WriteString("  " + label + " " + val + "\n")
+	}
+
+	sb.WriteString("\n")
+	sb.WriteString(lipgloss.NewStyle().Foreground(colorWarning).Bold(true).Render(
+		"  ! Press Enter to migrate (target may be overwritten).\n"))
+	sb.WriteString("\n")
+	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
+		"  [c] clean   [m] create-db   [s] schema-only   [a] data-only   [Enter] proceed   [esc] back\n"))
+	return sb.String()
+}
+
+// ─── Migrating (2-phase progress) ─────────────────────────────────────────────
+
+func (m Model) viewMigrating() string {
+	var sb strings.Builder
+
+	title := lipgloss.NewStyle().
+		Foreground(colorText).
+		Background(colorPrimary).
+		Bold(true).
+		Padding(0, 2).
+		Render("dbtool — Migrating Database")
+	sb.WriteString(title + "\n\n")
+
+	sb.WriteString("  Source: " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(m.result.Profile.Name) + "\n")
+	sb.WriteString("  Target: " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(m.result.DestProfile.Name) + "\n\n")
+
+	width := m.width - 10
+	if width < 20 {
+		width = 20
+	}
+	if width > 60 {
+		width = 60
+	}
+
+	filledW := int(float64(width) * (m.migrateProgressPct / 100.0))
+	if filledW < 0 {
+		filledW = 0
+	}
+	if filledW > width {
+		filledW = width
+	}
+	emptyW := width - filledW
+
+	filledStr := lipgloss.NewStyle().Foreground(colorSuccess).Render(strings.Repeat("█", filledW))
+	emptyStr := lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("░", emptyW))
+
+	phaseLabel := "Phase 1/2: Dump"
+	if m.migratePhase == 1 {
+		phaseLabel = "Phase 2/2: Restore"
+	}
+
+	sb.WriteString(fmt.Sprintf("  [%s%s] %.0f%%  %s\n\n", filledStr, emptyStr, m.migrateProgressPct, phaseLabel))
+	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSubtext).Render(m.migrateProgressText) + "\n")
+
+	return sb.String()
+}
+
+// handleMigratePhaseFinished transitions between the dump and restore phases,
+// or finalizes the migration after the restore phase completes.
+func (m Model) handleMigratePhaseFinished(msg migratePhaseFinishedMsg) (tea.Model, tea.Cmd) {
+	if msg.err != nil || m.migrateErr != nil {
+		err := msg.err
+		if err == nil {
+			err = m.migrateErr
+		}
+		m.finalizeMigrate(err)
+		m.step = stepMigrateResult
+		return m, nil
+	}
+
+	if msg.phase == 0 {
+		src := m.result.Profile
+		dst := m.result.DestProfile
+		drv, err := driver.Get(src.Driver)
+		if err != nil {
+			m.finalizeMigrate(err)
+			m.step = stepMigrateResult
+			return m, nil
+		}
+
+		format := driver.Format(m.result.MigrateSettings.Format)
+		if format == "" {
+			format = driver.FormatCustom
+		}
+		detected, err := drv.DetectFormat(m.migrateTempPath)
+		if err != nil || detected == driver.FormatUnknown {
+			detected = format
+		}
+
+		restoreOpts := driver.RestoreOptions{
+			Profile:         dst,
+			FilePath:        m.migrateTempPath,
+			Format:          detected,
+			Jobs:            m.result.MigrateSettings.Jobs,
+			Clean:           m.result.MigrateSettings.Clean,
+			IncludeTable:    m.result.MigrateSettings.IncludeTable,
+			ExcludeTable:    m.result.MigrateSettings.ExcludeTable,
+			IncludeSchema:   m.result.MigrateSettings.IncludeSchema,
+			ExcludeSchema:   m.result.MigrateSettings.ExcludeSchema,
+			CreateIfMissing: m.result.MigrateSettings.CreateIfMissing,
+		}
+
+		ch, err := drv.Restore(context.Background(), restoreOpts)
+		if err != nil {
+			m.finalizeMigrate(err)
+			m.step = stepMigrateResult
+			return m, nil
+		}
+		m.migrateProgressChan = ch
+		m.migratePhase = 1
+		m.migrateProgressPct = 0
+		m.migrateProgressText = "Phase 2/2: Restoring into target..."
+		return m, listenToMigrateProgress(ch, 1)
+	}
+
+	m.finalizeMigrate(nil)
+	m.step = stepMigrateResult
+	return m, nil
+}
+
+// finalizeMigrate records history (dump + restore entries) and sends a notification,
+// then cleans up the temp dump file.
+func (m *Model) finalizeMigrate(err error) {
+	src := m.result.Profile
+	dst := m.result.DestProfile
+
+	if m.migrateTempPath != "" {
+		defer os.RemoveAll(m.migrateTempPath)
+	}
+
+	now := time.Now()
+	dumpCmd := fmt.Sprintf("migrate(dump): pg_dump -h %s -p %d -U %s -d %s -f %s",
+		src.Host, src.Port, src.User, src.Database, m.migrateTempPath)
+
+	dumpRec := history.HistoryRecord{
+		File:    m.migrateTempPath,
+		Profile: src.Name,
+		Time:    now,
+		Success: m.migratePhase >= 1,
+		Command: dumpCmd,
+	}
+	if m.migratePhase == 0 && err != nil {
+		dumpRec.Success = false
+		dumpRec.Error = err.Error()
+	}
+	_ = history.AppendHistory(dumpRec)
+
+	if m.migratePhase >= 1 {
+		restoreCmd := fmt.Sprintf("migrate(restore): pg_restore -h %s -p %d -U %s -d %s -f %s",
+			dst.Host, dst.Port, dst.User, dst.Database, m.migrateTempPath)
+		restoreRec := history.HistoryRecord{
+			File:    m.migrateTempPath,
+			Profile: dst.Name,
+			Time:    now,
+			Success: err == nil,
+			Command: restoreCmd,
+		}
+		if err != nil {
+			restoreRec.Error = err.Error()
+		}
+		_ = history.AppendHistory(restoreRec)
+	}
+
+	if err != nil {
+		m.migrateErr = err
+		_ = beeep.Notify("DBTool Migrate Failed", fmt.Sprintf("%s -> %s: %v", src.Name, dst.Name, err), "")
+	} else {
+		_ = beeep.Notify("DBTool Migrate Success", fmt.Sprintf("%s -> %s migrated", src.Database, dst.Database), "")
+	}
+}
+
+func (m Model) viewMigrateResult() string {
+	var sb strings.Builder
+
+	title := lipgloss.NewStyle().
+		Foreground(colorText).
+		Background(colorPrimary).
+		Bold(true).
+		Padding(0, 2).
+		Render("dbtool — Migration Result")
+	sb.WriteString(title + "\n\n")
+
+	if m.migrateErr != nil {
+		sb.WriteString("  " + lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")).Bold(true).Render("❌ Migration Failed") + "\n\n")
+		sb.WriteString("  Error details:\n")
+		sb.WriteString(panelStyle.Width(m.width-4).Render(m.migrateErr.Error()) + "\n\n")
+	} else {
+		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("✓ Migration Completed Successfully!") + "\n\n")
+		sb.WriteString("  Source: " + valueStyle.Render(m.result.Profile.Name) + " (" + m.result.Profile.Database + ")\n")
+		sb.WriteString("  Target: " + valueStyle.Render(m.result.DestProfile.Name) + " (" + m.result.DestProfile.Database + ")\n\n")
+	}
+
+	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
+		"  Press any key to do another operation • Q / Esc to quit\n"))
+	return sb.String()
+}
+
+// createMigrateTempPath allocates a temp path for the intermediate dump file/dir.
+func createMigrateTempPath(format driver.Format) (string, error) {
+	pattern := "dbtool-migrate-*.dump"
+	if format == driver.FormatDirectory {
+		pattern = "dbtool-migrate-*"
+	}
+	f, err := os.CreateTemp("", pattern)
+	if err != nil {
+		return "", err
+	}
+	name := f.Name()
+	f.Close()
+	if format == driver.FormatDirectory {
+		_ = os.Remove(name)
+		if err := os.MkdirAll(name, 0755); err != nil {
+			return "", err
+		}
+	}
+	return name, nil
 }

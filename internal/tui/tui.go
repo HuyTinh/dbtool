@@ -12,6 +12,7 @@ type Mode int
 const (
 	ModeRestore Mode = iota
 	ModeDump
+	ModeMigrate
 )
 
 // RestoreSettings holds target configuration for dbtool restore command
@@ -34,6 +35,20 @@ type DumpSettings struct {
 	ExcludeTable  []string
 	IncludeSchema []string
 	ExcludeSchema []string
+}
+
+// MigrateSettings holds configuration for dbtool migrate command
+type MigrateSettings struct {
+	Format          string
+	SchemaOnly      bool
+	DataOnly        bool
+	Clean           bool
+	CreateIfMissing bool
+	Jobs            int
+	IncludeTable    []string
+	ExcludeTable    []string
+	IncludeSchema   []string
+	ExcludeSchema   []string
 }
 
 // Run launches the interactive TUI (starts at mode-select screen) and returns the user selection.

@@ -220,6 +220,12 @@ func buildDumpArgs(opts driver.DumpOptions) (string, []string) {
 	case driver.FormatPlain:
 		args = append(args, "-Fp")
 	}
+	if opts.SchemaOnly {
+		args = append(args, "-s")
+	}
+	if opts.DataOnly {
+		args = append(args, "-a")
+	}
 	for _, t := range opts.IncludeTable {
 		args = append(args, "-t", t)
 	}
