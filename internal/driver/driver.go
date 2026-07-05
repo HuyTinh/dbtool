@@ -12,6 +12,7 @@ const (
 	FormatCustom    Format = "custom"
 	FormatPlain     Format = "plain"
 	FormatDirectory Format = "directory"
+	FormatTar       Format = "tar"
 	FormatUnknown   Format = "unknown"
 )
 

@@ -69,7 +69,7 @@ func detectFormatFromFile(filePath string) (driver.Format, error) {
 	_, _ = f.Seek(0, 0)
 	tr := tar.NewReader(f)
 	if _, err := tr.Next(); err == nil {
-		return driver.FormatCustom, nil // pg_restore processes tar files
+		return driver.FormatTar, nil
 	}
 
 	// 3. Fallback to Plain SQL format

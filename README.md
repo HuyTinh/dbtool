@@ -48,6 +48,12 @@ Lệnh khả dụng:
   restore     Khôi phục CSDL từ file dump
   migrate     Sao chép schema+dữ liệu từ profile A sang profile B
   inspect     Kiểm tra nội dung file dump (danh sách bảng, view)
+  pitr        Point-in-Time Recovery (khôi phục theo thời điểm)
+    setup     Cấu hình WAL archiving cho profile
+    backup    Tạo base backup cho PITR
+    restore   Khôi phục CSDL đến thời điểm cụ thể
+    status    Hiển thị trạng thái PITR, backup, WAL
+    cleanup   Xóa backup và WAL cũ theo retention policy
   history     Xem lịch sử thao tác dump/restore
   doctor      Kiểm tra cấu hình và kết nối hệ thống
   cache       Quản lý cache nội bộ
@@ -146,7 +152,9 @@ dbtool tui
 |---|---|---|
 | Chọn profile | `[a]` thêm, `[e]` sửa, `[d]` xóa, `[p]` đổi profile | Quản lý profile kết nối trực tiếp trong TUI. Profile đã chọn được ghi nhớ cho các thao tác tiếp theo. |
 | Duyệt file dump | `/` tìm kiếm, `[enter]` chọn, `[backspace]` quay lại | Duyệt thư mục, tìm file dump theo tên. Hỗ trợ filter để tìm nhanh. |
-| Xác nhận restore | `[enter]` xác nhận, `[m]` bật create-if-missing | Xem lại cấu hình trước khi restore. |
+| Xác nhận restore | `[c]` clean, `[m]` create-db, `[o]` optimize, `[t/T]` table, `[h/H]` schema | Xem lại cấu hình trước khi restore. Hỗ trợ nhập filter schema/table trực tiếp. |
+| Xác nhận dump | `[t]` inc-table, `[T]` exc-table, `[h]` inc-schema, `[H]` exc-schema | Xem lại cấu hình trước khi dump. Hỗ trợ nhập filter schema/table trực tiếp. |
+| Xác nhận migrate | `[c]` clean, `[m]` create-db, `[s]` schema-only, `[a]` data-only, `[o]` optimize, `[t/T]` table, `[h/H]` schema | Cấu hình migrate chi tiết. Hỗ trợ nhập filter schema/table trực tiếp. |
 | Chọn profile đích (migrate) | `[enter]` chọn | Chọn profile đích để migrate schema+dữ liệu. |
 | Đang restore/migrate | — | Thanh tiến trình và log realtime. |
 
@@ -261,6 +269,7 @@ dbtool restore [file_or_directory] --profile <tên-profile> [flags]
 | `-j, --jobs` | Số luồng restore song song (chỉ áp dụng cho định dạng `directory`) | số CPU |
 | `--clean` | Xóa các object cũ trong DB trước khi restore |  `false` |
 | `--create-if-missing` | Tự động tạo CSDL đích nếu chưa tồn tại | `false` |
+| `--optimize` | Chạy VACUUM ANALYZE sau khi restore | `false` |
 | `--dry-run` | Hiển thị lệnh sẽ chạy mà không thực thi | `false` |
 | `--include-table` | Chỉ restore bảng chỉ định (có thể lặp) | — |
 | `--exclude-table` | Bỏ qua bảng chỉ định khi restore (có thể lặp) | — |
@@ -317,6 +326,7 @@ dbtool migrate --from <profile-nguồn> --to <profile-đích> [flags]
 | `--create-if-missing` | Tự động tạo CSDL đích nếu chưa tồn tại | `false` |
 | `-j, --jobs` | Số luồng restore song song (chỉ áp dụng cho định dạng `directory`) | `4` |
 | `--keep-temp` | Giữ file dump trung gian sau khi migrate | `false` |
+| `--optimize` | Chạy VACUUM ANALYZE trên target sau migrate | `false` |
 | `--dry-run` | Hiển thị lệnh sẽ chạy mà không thực thi | `false` |
 | `--include-table` | Chỉ migrate bảng chỉ định (có thể lặp) | — |
 | `--exclude-table` | Bỏ qua bảng chỉ định (có thể lặp) | — |
@@ -432,6 +442,170 @@ dbtool cache clear --namespace toc
 
 ---
 
+### 10. Point-in-Time Recovery (`pitr`)
+
+Khôi phục CSDL đến bất kỳ thời điểm nào trong quá khứ, dựa trên base backup và WAL archive.
+
+#### 10.1. Cấu hình PITR (`pitr setup`)
+
+Tự động cấu hình WAL archiving cho một profile PostgreSQL. Lệnh sẽ:
+- Kiểm tra cấu hình PostgreSQL hiện tại (`wal_level`, `archive_mode`, `archive_command`)
+- Tạo thư mục lưu WAL archive và base backup
+- Áp dụng cấu hình qua `ALTER SYSTEM SET` (không cần sửa thủ công `postgresql.conf`)
+- Yêu cầu restart PostgreSQL nếu thay đổi `wal_level` hoặc `archive_mode`
+
+```bash
+dbtool pitr setup --profile <tên-profile> [flags]
+```
+
+| Flag | Mô tả | Mặc định |
+|---|---|---|
+| `--profile` | Tên profile kết nối | *(bắt buộc)* |
+| `--archive-dir` | Thư mục lưu WAL archive | `~/.config/dbtool/pitr/<profile>/wal` |
+| `--base-backup-dir` | Thư mục lưu base backup | `~/.config/dbtool/pitr/<profile>/base` |
+| `--retention-backups` | Số base backup giữ lại | `3` |
+| `--retention-days` | Số ngày giữ WAL files | `7` |
+| `--dry-run` | Hiển thị thay đổi sẽ áp dụng mà không thực thi | `false` |
+
+**Ví dụ:**
+
+```bash
+# Cấu hình PITR cho profile local-dev
+dbtool pitr setup --profile local-dev
+
+# Xem trước thay đổi sẽ áp dụng
+dbtool pitr setup --profile local-dev --dry-run
+
+# Tùy chỉnh thư mục và retention
+dbtool pitr setup --profile local-dev \
+  --archive-dir /data/wal-archive \
+  --base-backup-dir /data/base-backups \
+  --retention-backups 5 \
+  --retention-days 14
+```
+
+#### 10.2. Tạo base backup (`pitr backup`)
+
+Tạo base backup bằng `pg_basebackup` và lưu metadata để sử dụng cho restore.
+
+```bash
+dbtool pitr backup --profile <tên-profile> [flags]
+```
+
+| Flag | Mô tả | Mặc định |
+|---|---|---|
+| `--profile` | Tên profile đã cấu hình PITR | *(bắt buộc)* |
+| `--jobs` | Số luồng song song | `2` |
+| `--checkpoint` | Chế độ checkpoint: `fast` hoặc `spread` | `fast` |
+| `--no-compress` | Tắt nén gzip | `false` |
+| `--dry-run` | Hiển thị lệnh sẽ chạy mà không thực thi | `false` |
+
+**Ví dụ:**
+
+```bash
+# Tạo base backup
+dbtool pitr backup --profile local-dev
+
+# Backup với 4 luồng, không nén
+dbtool pitr backup --profile local-dev --jobs 4 --no-compress
+```
+
+#### 10.3. Khôi phục theo thời điểm (`pitr restore`)
+
+Khôi phục CSDL đến một thời điểm cụ thể trong quá khứ.
+
+```bash
+dbtool pitr restore --profile <profile> --to '<timestamp>' [flags]
+```
+
+| Flag | Mô tả | Mặc định |
+|---|---|---|
+| `--profile` | Profile nguồn đã cấu hình PITR | *(bắt buộc)* |
+| `--to` | Thời điểm khôi phục (format: `2024-01-15 14:30:00`) | *(bắt buộc)* |
+| `--target-profile` | Profile đích (mặc định: cùng profile nguồn) | — |
+| `--timeline` | Timeline ID (mặc định: mới nhất) | `0` |
+| `--clean` | Xóa objects trước khi restore | `false` |
+| `--create-if-missing` | Tạo CSDL đích nếu chưa tồn tại | `false` |
+| `--dry-run` | Hiển thị recovery plan mà không thực thi | `false` |
+
+**Ví dụ:**
+
+```bash
+# Khôi phục đến thời điểm cụ thể
+dbtool pitr restore --profile local-dev --to '2026-07-05 10:30:00'
+
+# Khôi phục sang profile khác
+dbtool pitr restore --profile local-dev --to '2026-07-05 10:30:00' \
+  --target-profile local-dev-recovery
+
+# Xem trước recovery plan
+dbtool pitr restore --profile local-dev --to '2026-07-05 10:30:00' --dry-run
+```
+
+> ⚠️ **Cảnh báo:** PITR restore sẽ **ghi đè** CSDL đích. Lệnh tự động backup data directory trước khi restore để an toàn.
+
+#### 10.4. Kiểm tra trạng thái (`pitr status`)
+
+Hiển thị thông tin toàn diện về PITR: cấu hình PostgreSQL, danh sách base backup, thống kê WAL archive và phạm vi khôi phục.
+
+```bash
+dbtool pitr status --profile <tên-profile>
+```
+
+**Ví dụ output:**
+
+```
+=== PITR Status for Profile: local-dev ===
+
+PostgreSQL Configuration:
+  Archive Mode:        on
+  WAL Level:           replica
+  Archive Command:     cp %p /home/user/.config/dbtool/pitr/local-dev/wal/%f
+
+Base Backups:
+  [1] 20260705_100000
+      Time:       2026-07-05 10:00:00 (2 hours ago)
+      Timeline:   1
+      Size:       256 MB
+      WAL Range:  000000010000000000000001 → 000000010000000000000003
+
+WAL Archive:
+  Total Files:         150 files
+  Total Size:          2.4 GB
+  Last Archived:       3 minutes ago
+
+Recovery Range:
+  Earliest Point:      2026-07-05 10:00:00
+  Latest Point:        2026-07-05 12:03:00
+  Coverage:            2 hours
+```
+
+#### 10.5. Dọn dẹp backup cũ (`pitr cleanup`)
+
+Xóa base backup và WAL files cũ theo retention policy.
+
+```bash
+dbtool pitr cleanup --profile <tên-profile> [flags]
+```
+
+| Flag | Mô tả | Mặc định |
+|---|---|---|
+| `--profile` | Tên profile | *(bắt buộc)* |
+| `--dry-run` | Hiển thị file sẽ xóa mà không thực hiện | `false` |
+| `--force` | Bỏ qua xác nhận | `false` |
+
+**Ví dụ:**
+
+```bash
+# Xem trước file sẽ xóa
+dbtool pitr cleanup --profile local-dev --dry-run
+
+# Xóa không cần xác nhận
+dbtool pitr cleanup --profile local-dev --force
+```
+
+---
+
 ## Cấu trúc dự án
 
 ```
@@ -446,6 +620,12 @@ dbtool/
 │   ├── migrate.go                  # `migrate` (sao chép giữa các profile)
 │   ├── tui.go                      # `tui` (giao diện tương tác)
 │   ├── inspect.go                  # `inspect`
+│   ├── pitr.go                     # `pitr` (parent command)
+│   ├── pitr_setup.go               # `pitr setup` (cấu hình WAL archiving)
+│   ├── pitr_backup.go              # `pitr backup` (tạo base backup)
+│   ├── pitr_restore.go             # `pitr restore` (khôi phục theo thời điểm)
+│   ├── pitr_status.go              # `pitr status` (trạng thái PITR)
+│   ├── pitr_cleanup.go             # `pitr cleanup` (dọn dẹp backup cũ)
 │   ├── history.go                  # `history`
 │   ├── cache.go                    # `cache list` / `cache clear`
 │   ├── doctor.go                   # `doctor`
@@ -454,7 +634,15 @@ dbtool/
     ├── config/                     # Đọc/ghi profiles.yaml
     ├── driver/                     # Interface Driver và registry
     │   └── postgres/               # PostgreSQL driver implementation
+    │       ├── restore.go          # Restore & dump logic
+    │       ├── detector.go         # Tự động nhận diện định dạng dump
+    │       └── pitr.go             # PostgreSQL PITR driver helpers
     ├── tui/                        # Giao diện tương tác (bubbletea)
+    ├── pitr/                       # PITR core logic
+    │   ├── basebackup.go           # pg_basebackup wrapper & metadata
+    │   ├── config.go               # PITR config load/save
+    │   ├── validation.go           # Validate backup integrity, WAL coverage, disk space
+    │   └── wal.go                  # WAL file parsing, LSN handling, range queries
     ├── importer/                   # Interface Importer và registry
     │   ├── springboot/             # Spring Boot config importer
     │   ├── dotenv/                 # .env file importer
@@ -474,3 +662,6 @@ dbtool/
 | Profiles | `%APPDATA%\dbtool\profiles.yaml` | `~/.config/dbtool/profiles.yaml` |
 | History | `%APPDATA%\dbtool\history.jsonl` | `~/.config/dbtool/history.jsonl` |
 | Cache | `%APPDATA%\dbtool\cache\` | `~/.config/dbtool/cache/` |
+| PITR Config | `%APPDATA%\dbtool\pitr\<profile>\config.yaml` | `~/.config/dbtool/pitr/<profile>/config.yaml` |
+| PITR WAL | `%APPDATA%\dbtool\pitr\<profile>\wal\` | `~/.config/dbtool/pitr/<profile>/wal/` |
+| PITR Backups | `%APPDATA%\dbtool\pitr\<profile>\base\` | `~/.config/dbtool/pitr/<profile>/base/` |

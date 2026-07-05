@@ -184,7 +184,9 @@ func ExecuteMigrateLogic(ctx context.Context, opts MigrateOptions) error {
 	for p := range dumpProg {
 		dumpLast = p
 		if !Quiet {
-			if Verbose || p.Err != nil || p.Percent == 100 {
+			if p.Err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", p.Err)
+			} else if Verbose || p.Percent == 100 {
 				fmt.Println(p.Message)
 			}
 		}
@@ -270,7 +272,9 @@ func ExecuteMigrateLogic(ctx context.Context, opts MigrateOptions) error {
 	for p := range restoreProg {
 		restoreLast = p
 		if !Quiet {
-			if Verbose || p.Err != nil || p.Percent == 100 {
+			if p.Err != nil {
+				fmt.Fprintf(os.Stderr, "Error: %v\n", p.Err)
+			} else if Verbose || p.Percent == 100 {
 				fmt.Println(p.Message)
 			}
 		}
@@ -327,6 +331,8 @@ func createTempDumpPath(format driver.Format) (string, error) {
 	pattern := "dbtool-migrate-*.dump"
 	if format == driver.FormatDirectory {
 		pattern = "dbtool-migrate-*"
+	} else if format == driver.FormatTar {
+		pattern = "dbtool-migrate-*.tar"
 	}
 	f, err := os.CreateTemp("", pattern)
 	if err != nil {
@@ -346,7 +352,7 @@ func createTempDumpPath(format driver.Format) (string, error) {
 func init() {
 	migrateCmd.Flags().StringVar(&migrateFrom, "from", "", "Source profile name")
 	migrateCmd.Flags().StringVar(&migrateTo, "to", "", "Destination profile name")
-	migrateCmd.Flags().StringVar(&migrateFormat, "format", "custom", "Intermediate dump format (custom, plain, directory)")
+	migrateCmd.Flags().StringVar(&migrateFormat, "format", "custom", "Intermediate dump format (custom, tar, plain, directory)")
 	migrateCmd.Flags().BoolVar(&migrateSchemaOnly, "schema-only", false, "Migrate schema only (no data)")
 	migrateCmd.Flags().BoolVar(&migrateDataOnly, "data-only", false, "Migrate data only (no schema)")
 	migrateCmd.Flags().BoolVar(&migrateClean, "clean", false, "Drop target objects before restore")

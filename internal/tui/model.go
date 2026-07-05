@@ -121,6 +121,11 @@ type Model struct {
 	migrateProgressText string
 	migrateErr          error
 
+	// Filter input mode
+	filterInputMode bool
+	filterInputType string // "include-table", "exclude-table", "include-schema", "exclude-schema"
+	filterInput     textinput.Model
+
 	// Terminal size
 	width  int
 	height int
@@ -149,6 +154,11 @@ func NewModel(cfg *config.Config, initSettings RestoreSettings) Model {
 	searchInput.CharLimit = 128
 	searchInput.Width = 50
 
+	filterInput := textinput.New()
+	filterInput.Placeholder = "e.g. users,orders,products"
+	filterInput.CharLimit = 1024
+	filterInput.Width = 80
+
 	m := Model{
 		step:            stepSelectMode,
 		profiles:        profiles,
@@ -158,6 +168,7 @@ func NewModel(cfg *config.Config, initSettings RestoreSettings) Model {
 		cfg:             cfg,
 		dumpOutputInput: dumpInput,
 		searchInput:     searchInput,
+		filterInput:     filterInput,
 	}
 	m.result.Settings = initSettings
 	m.result.DumpSettings = DumpSettings{Format: "custom"}
@@ -487,6 +498,22 @@ func (m Model) visibleEntries() []fileEntry {
 }
 
 func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Handle filter input mode
+	if m.filterInputMode {
+		switch msg.String() {
+		case "enter":
+			m.saveFilterInput()
+			return m, nil
+		case "esc":
+			m.cancelFilterInput()
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.filterInput, cmd = m.filterInput.Update(msg)
+			return m, cmd
+		}
+	}
+
 	switch msg.String() {
 	case "enter", "y":
 		m.result.Confirm = true
@@ -568,6 +595,18 @@ func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.result.Settings.Jobs > 1 {
 			m.result.Settings.Jobs--
 		}
+	case "t":
+		m.openFilterInput("include-table")
+		return m, m.filterInput.Focus()
+	case "T":
+		m.openFilterInput("exclude-table")
+		return m, m.filterInput.Focus()
+	case "h":
+		m.openFilterInput("include-schema")
+		return m, m.filterInput.Focus()
+	case "H":
+		m.openFilterInput("exclude-schema")
+		return m, m.filterInput.Focus()
 	}
 	return m, nil
 }
@@ -607,6 +646,10 @@ func (m Model) View() string {
 	if m.step == stepDone {
 		return ""
 	}
+	// Show filter input overlay if active
+	if m.filterInputMode {
+		return m.viewFilterInput()
+	}
 	switch m.step {
 	case stepSelectMode:
 		return m.viewSelectMode()
@@ -643,6 +686,190 @@ func (m Model) View() string {
 	}
 	return ""
 }
+
+// ─── Filter Input Helpers ────────────────────────────────────────────────────
+
+func (m *Model) openFilterInput(filterType string) {
+	m.filterInputMode = true
+	m.filterInputType = filterType
+
+	var currentValues []string
+	switch filterType {
+	case "include-table":
+		currentValues = m.getIncludeTable()
+	case "exclude-table":
+		currentValues = m.getExcludeTable()
+	case "include-schema":
+		currentValues = m.getIncludeSchema()
+	case "exclude-schema":
+		currentValues = m.getExcludeSchema()
+	}
+
+	m.filterInput.SetValue(strings.Join(currentValues, ", "))
+	m.filterInput.Focus()
+}
+
+func (m *Model) saveFilterInput() {
+	values := parseFilterValues(m.filterInput.Value())
+
+	switch m.filterInputType {
+	case "include-table":
+		m.setIncludeTable(values)
+	case "exclude-table":
+		m.setExcludeTable(values)
+	case "include-schema":
+		m.setIncludeSchema(values)
+	case "exclude-schema":
+		m.setExcludeSchema(values)
+	}
+
+	m.filterInputMode = false
+}
+
+func (m *Model) cancelFilterInput() {
+	m.filterInputMode = false
+}
+
+// Getters/Setters for filter values based on current step
+func (m *Model) getIncludeTable() []string {
+	switch m.step {
+	case stepDumpConfirm:
+		return m.result.DumpSettings.IncludeTable
+	case stepMigrateConfirm:
+		return m.result.MigrateSettings.IncludeTable
+	default:
+		return m.result.Settings.IncludeTable
+	}
+}
+
+func (m *Model) getExcludeTable() []string {
+	switch m.step {
+	case stepDumpConfirm:
+		return m.result.DumpSettings.ExcludeTable
+	case stepMigrateConfirm:
+		return m.result.MigrateSettings.ExcludeTable
+	default:
+		return m.result.Settings.ExcludeTable
+	}
+}
+
+func (m *Model) getIncludeSchema() []string {
+	switch m.step {
+	case stepDumpConfirm:
+		return m.result.DumpSettings.IncludeSchema
+	case stepMigrateConfirm:
+		return m.result.MigrateSettings.IncludeSchema
+	default:
+		return m.result.Settings.IncludeSchema
+	}
+}
+
+func (m *Model) getExcludeSchema() []string {
+	switch m.step {
+	case stepDumpConfirm:
+		return m.result.DumpSettings.ExcludeSchema
+	case stepMigrateConfirm:
+		return m.result.MigrateSettings.ExcludeSchema
+	default:
+		return m.result.Settings.ExcludeSchema
+	}
+}
+
+func (m *Model) setIncludeTable(values []string) {
+	switch m.step {
+	case stepDumpConfirm:
+		m.result.DumpSettings.IncludeTable = values
+	case stepMigrateConfirm:
+		m.result.MigrateSettings.IncludeTable = values
+	default:
+		m.result.Settings.IncludeTable = values
+	}
+}
+
+func (m *Model) setExcludeTable(values []string) {
+	switch m.step {
+	case stepDumpConfirm:
+		m.result.DumpSettings.ExcludeTable = values
+	case stepMigrateConfirm:
+		m.result.MigrateSettings.ExcludeTable = values
+	default:
+		m.result.Settings.ExcludeTable = values
+	}
+}
+
+func (m *Model) setIncludeSchema(values []string) {
+	switch m.step {
+	case stepDumpConfirm:
+		m.result.DumpSettings.IncludeSchema = values
+	case stepMigrateConfirm:
+		m.result.MigrateSettings.IncludeSchema = values
+	default:
+		m.result.Settings.IncludeSchema = values
+	}
+}
+
+func (m *Model) setExcludeSchema(values []string) {
+	switch m.step {
+	case stepDumpConfirm:
+		m.result.DumpSettings.ExcludeSchema = values
+	case stepMigrateConfirm:
+		m.result.MigrateSettings.ExcludeSchema = values
+	default:
+		m.result.Settings.ExcludeSchema = values
+	}
+}
+
+// parseFilterValues splits comma-separated input into trimmed values
+func parseFilterValues(input string) []string {
+	input = strings.TrimSpace(input)
+	if input == "" {
+		return nil
+	}
+	parts := strings.Split(input, ",")
+	var result []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			result = append(result, p)
+		}
+	}
+	return result
+}
+
+// viewFilterInput renders the filter input overlay
+func (m Model) viewFilterInput() string {
+	var sb strings.Builder
+
+	var title string
+	switch m.filterInputType {
+	case "include-table":
+		title = "Include Tables"
+	case "exclude-table":
+		title = "Exclude Tables"
+	case "include-schema":
+		title = "Include Schemas"
+	case "exclude-schema":
+		title = "Exclude Schemas"
+	}
+
+	header := lipgloss.NewStyle().
+		Foreground(colorText).
+		Background(colorPrimary).
+		Bold(true).
+		Padding(0, 2).
+		Render("dbtool — " + title)
+	sb.WriteString(header + "\n\n")
+
+	sb.WriteString("  Enter values separated by commas:\n\n")
+	sb.WriteString("  " + m.filterInput.View() + "\n\n")
+
+	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
+		"  [Enter] save   [esc] cancel\n"))
+
+	return sb.String()
+}
+
+// ─── Render Helpers ──────────────────────────────────────────────────────────
 
 // renderRow renders a single list row.
 // selected rows: bold accent foreground + "▶" prefix
@@ -902,7 +1129,7 @@ func (m Model) viewConfirm() string {
 		"  ! Press Enter to execute database restoration.\n"))
 	sb.WriteString("\n")
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  [c] toggle clean   [m] toggle create-db   [o] toggle optimize   [+/-] jobs   [Enter] proceed   [esc] back\n"))
+		"  [c] clean   [m] create-db   [o] optimize   [+/-] jobs   [t/T] table   [h/H] schema   [Enter] proceed   [esc] back\n"))
 	return sb.String()
 }
 
@@ -1487,6 +1714,22 @@ func (m Model) viewDumpOutputPath() string {
 // ─── Dump Confirm ────────────────────────────────────────────────────────────
 
 func (m Model) updateDumpConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Handle filter input mode
+	if m.filterInputMode {
+		switch msg.String() {
+		case "enter":
+			m.saveFilterInput()
+			return m, nil
+		case "esc":
+			m.cancelFilterInput()
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.filterInput, cmd = m.filterInput.Update(msg)
+			return m, cmd
+		}
+	}
+
 	switch msg.String() {
 	case "enter", "y":
 		m.result.DumpConfirm = true
@@ -1526,6 +1769,18 @@ func (m Model) updateDumpConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "n", "q", "ctrl+c", "esc":
 		m.step = stepDumpOutputPath
+	case "t":
+		m.openFilterInput("include-table")
+		return m, m.filterInput.Focus()
+	case "T":
+		m.openFilterInput("exclude-table")
+		return m, m.filterInput.Focus()
+	case "h":
+		m.openFilterInput("include-schema")
+		return m, m.filterInput.Focus()
+	case "H":
+		m.openFilterInput("exclude-schema")
+		return m, m.filterInput.Focus()
 	}
 	return m, nil
 }
@@ -1551,10 +1806,25 @@ func (m Model) viewDumpConfirm() string {
 			labelStyle.Render("DB     ")+" "+valueStyle.Render(m.result.Profile.Database)+"\n"+
 			labelStyle.Render("Output ")+" "+valueStyle.Render(m.result.DumpFile)+"\n"+
 			labelStyle.Render("Format ")+" "+valueStyle.Render(format),
-	) + "\n\n")
+	) + "\n")
 
+	s := m.result.DumpSettings
+	if len(s.IncludeSchema) > 0 {
+		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Inc Schema:") + " " + strings.Join(s.IncludeSchema, ", ") + "\n")
+	}
+	if len(s.ExcludeSchema) > 0 {
+		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Exc Schema:") + " " + strings.Join(s.ExcludeSchema, ", ") + "\n")
+	}
+	if len(s.IncludeTable) > 0 {
+		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Inc Table:") + " " + strings.Join(s.IncludeTable, ", ") + "\n")
+	}
+	if len(s.ExcludeTable) > 0 {
+		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Exc Table:") + " " + strings.Join(s.ExcludeTable, ", ") + "\n")
+	}
+
+	sb.WriteString("\n")
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  Enter / Y to start dump • N / Esc to go back\n"))
+		"  [Enter/Y] dump   [esc] back   [t] inc-table   [T] exc-table   [h] inc-schema   [H] exc-schema\n"))
 	return sb.String()
 }
 
@@ -1745,6 +2015,22 @@ func (m Model) viewMigrateDestSelector() string {
 // ─── Migrate: confirm ────────────────────────────────────────────────────────
 
 func (m Model) updateMigrateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
+	// Handle filter input mode
+	if m.filterInputMode {
+		switch msg.String() {
+		case "enter":
+			m.saveFilterInput()
+			return m, nil
+		case "esc":
+			m.cancelFilterInput()
+			return m, nil
+		default:
+			var cmd tea.Cmd
+			m.filterInput, cmd = m.filterInput.Update(msg)
+			return m, cmd
+		}
+	}
+
 	switch msg.String() {
 	case "enter", "y":
 		m.result.MigrateConfirm = true
@@ -1829,6 +2115,18 @@ func (m Model) updateMigrateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "o", "O":
 		m.result.MigrateSettings.Optimize = !m.result.MigrateSettings.Optimize
+	case "t":
+		m.openFilterInput("include-table")
+		return m, m.filterInput.Focus()
+	case "T":
+		m.openFilterInput("exclude-table")
+		return m, m.filterInput.Focus()
+	case "h":
+		m.openFilterInput("include-schema")
+		return m, m.filterInput.Focus()
+	case "H":
+		m.openFilterInput("exclude-schema")
+		return m, m.filterInput.Focus()
 	}
 	return m, nil
 }
@@ -1897,7 +2195,7 @@ func (m Model) viewMigrateConfirm() string {
 		"  ! Press Enter to migrate (target may be overwritten).\n"))
 	sb.WriteString("\n")
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  [c] clean   [m] create-db   [s] schema-only   [a] data-only   [o] optimize   [Enter] proceed   [esc] back\n"))
+		"  [c] clean   [m] create-db   [s] schema-only   [a] data-only   [o] optimize   [t/T] table   [h/H] schema   [Enter] proceed   [esc] back\n"))
 	return sb.String()
 }
 

@@ -61,6 +61,10 @@ func (d *PostgresDriver) Restore(ctx context.Context, opts driver.RestoreOptions
 		var wg sync.WaitGroup
 		wg.Add(2)
 
+		// Accumulate stderr lines for better error reporting
+		var stderrLines []string
+		var stderrMu sync.Mutex
+
 		go func() {
 			defer wg.Done()
 			scanStream(stdout, progressChan, false, 0, false)
@@ -68,17 +72,33 @@ func (d *PostgresDriver) Restore(ctx context.Context, opts driver.RestoreOptions
 
 		go func() {
 			defer wg.Done()
-			scanStream(stderr, progressChan, true, totalTOC, false)
+			wrappedStderr := &teeReader{
+				reader: stderr,
+				lines:  &stderrLines,
+				mu:     &stderrMu,
+			}
+			scanStream(wrappedStderr, progressChan, true, totalTOC, false)
 		}()
 
 		wg.Wait()
 
 		err := cmd.Wait()
 		if err != nil {
-			sendProgress(progressChan, driver.Progress{
-				Done: true,
-				Err:  fmt.Errorf("restore command failed: %w", err),
-			})
+			stderrMu.Lock()
+			errMsg := strings.Join(stderrLines, "\n")
+			stderrMu.Unlock()
+
+			if errMsg != "" {
+				sendProgress(progressChan, driver.Progress{
+					Done: true,
+					Err:  fmt.Errorf("restore command failed: %w\n%s", err, errMsg),
+				})
+			} else {
+				sendProgress(progressChan, driver.Progress{
+					Done: true,
+					Err:  fmt.Errorf("restore command failed: %w", err),
+				})
+			}
 			return
 		}
 
@@ -129,6 +149,10 @@ func (d *PostgresDriver) Dump(ctx context.Context, opts driver.DumpOptions) (<-c
 		var wg sync.WaitGroup
 		wg.Add(2)
 
+		// Accumulate stderr lines for better error reporting
+		var stderrLines []string
+		var stderrMu sync.Mutex
+
 		go func() {
 			defer wg.Done()
 			scanStream(stdout, progressChan, false, 0, true)
@@ -136,17 +160,34 @@ func (d *PostgresDriver) Dump(ctx context.Context, opts driver.DumpOptions) (<-c
 
 		go func() {
 			defer wg.Done()
-			scanStream(stderr, progressChan, true, totalTables, true)
+			// Wrap stderr to also capture lines for error reporting
+			wrappedStderr := &teeReader{
+				reader: stderr,
+				lines:  &stderrLines,
+				mu:     &stderrMu,
+			}
+			scanStream(wrappedStderr, progressChan, true, totalTables, true)
 		}()
 
 		wg.Wait()
 
 		err := cmd.Wait()
 		if err != nil {
-			sendProgress(progressChan, driver.Progress{
-				Done: true,
-				Err:  fmt.Errorf("dump command failed: %w", err),
-			})
+			stderrMu.Lock()
+			errMsg := strings.Join(stderrLines, "\n")
+			stderrMu.Unlock()
+
+			if errMsg != "" {
+				sendProgress(progressChan, driver.Progress{
+					Done: true,
+					Err:  fmt.Errorf("dump command failed: %w\n%s", err, errMsg),
+				})
+			} else {
+				sendProgress(progressChan, driver.Progress{
+					Done: true,
+					Err:  fmt.Errorf("dump command failed: %w", err),
+				})
+			}
 			return
 		}
 
@@ -158,6 +199,32 @@ func (d *PostgresDriver) Dump(ctx context.Context, opts driver.DumpOptions) (<-c
 	}()
 
 	return progressChan, nil
+}
+
+// teeReader wraps a reader and captures lines for error reporting
+type teeReader struct {
+	reader io.Reader
+	lines  *[]string
+	mu     *sync.Mutex
+}
+
+func (t *teeReader) Read(p []byte) (n int, err error) {
+	n, err = t.reader.Read(p)
+	if n > 0 {
+		t.mu.Lock()
+		// Capture lines for error reporting (keep last 20 lines)
+		text := string(p[:n])
+		for _, line := range strings.Split(strings.TrimSpace(text), "\n") {
+			if line != "" {
+				*t.lines = append(*t.lines, line)
+				if len(*t.lines) > 20 {
+					*t.lines = (*t.lines)[1:]
+				}
+			}
+		}
+		t.mu.Unlock()
+	}
+	return
 }
 
 func buildRestoreArgs(opts driver.RestoreOptions) (string, []string) {
@@ -219,6 +286,8 @@ func buildDumpArgs(opts driver.DumpOptions) (string, []string) {
 		args = append(args, "-Fd")
 	case driver.FormatPlain:
 		args = append(args, "-Fp")
+	case driver.FormatTar:
+		args = append(args, "-Ft")
 	}
 	if opts.SchemaOnly {
 		args = append(args, "-s")
