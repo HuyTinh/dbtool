@@ -16,6 +16,9 @@ var (
 	Quiet   bool
 	Verbose bool
 	Timeout string
+	Version = "v0.0.2"
+	Commit  = "none"
+	Date    = "unknown"
 )
 
 var RootCmd = &cobra.Command{
@@ -30,6 +33,7 @@ var RootCmd = &cobra.Command{
 }
 
 func init() {
+	RootCmd.Version = Version
 	RootCmd.PersistentFlags().BoolVarP(&Quiet, "quiet", "q", false, "Suppress progress outputs and only display errors")
 	RootCmd.PersistentFlags().BoolVarP(&Verbose, "verbose", "v", false, "Print detailed logs of subprocess execution")
 	RootCmd.PersistentFlags().StringVar(&Timeout, "timeout", "", "Operation execution timeout (e.g., 2h, 45m, 15s)")
