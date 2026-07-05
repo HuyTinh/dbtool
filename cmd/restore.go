@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"runtime"
@@ -31,215 +32,219 @@ var (
 	excludeSchema          []string
 )
 
+func ExecuteRestoreLogic(ctx context.Context, filePath string) error {
+	// 1. Verify file exists and is readable early
+	if err := validateDumpFile(filePath); err != nil {
+		return err
+	}
+
+	// 2. Validate filter patterns early
+	for _, pat := range includeTable {
+		if err := postgres.ValidateTablePattern(pat); err != nil {
+			return err
+		}
+	}
+	for _, pat := range excludeTable {
+		if err := postgres.ValidateTablePattern(pat); err != nil {
+			return err
+		}
+	}
+	for _, pat := range includeSchema {
+		if err := postgres.ValidateTablePattern(pat); err != nil {
+			return err
+		}
+	}
+	for _, pat := range excludeSchema {
+		if err := postgres.ValidateTablePattern(pat); err != nil {
+			return err
+		}
+	}
+
+	// 3. Load profile configuration
+	cfg, err := config.LoadConfig()
+	if err != nil {
+		return err
+	}
+
+	profile, ok := cfg.GetProfile(restoreProfile)
+	if !ok {
+		return fmt.Errorf("profile %q not found in configurations", restoreProfile)
+	}
+
+	// 4. Retrieve database driver from registry
+	drv, err := driver.Get(profile.Driver)
+	if err != nil {
+		return err
+	}
+
+	// 5. Detect file format
+	detectedFormat, err := drv.DetectFormat(filePath)
+	if err != nil {
+		return fmt.Errorf("failed to detect dump format: %w", err)
+	}
+
+	fmt.Printf("Detected dump format: %s\n", detectedFormat)
+
+	// Set default format if not provided
+	finalFormat := driver.Format(restoreFormat)
+	if finalFormat == "" || finalFormat == "auto" {
+		finalFormat = detectedFormat
+	}
+
+	opts := driver.RestoreOptions{
+		Profile:         profile,
+		FilePath:        filePath,
+		Format:          finalFormat,
+		Jobs:            restoreJobs,
+		Clean:           restoreClean,
+		IncludeTable:    includeTable,
+		ExcludeTable:    excludeTable,
+		IncludeSchema:   includeSchema,
+		ExcludeSchema:   excludeSchema,
+		DryRun:          restoreDryRun,
+		CreateIfMissing: restoreCreateIfMissing,
+	}
+
+	cmdString := getDryRunCommand(opts)
+
+	// 6. Handle Dry Run
+	if restoreDryRun {
+		if restoreClean {
+			fmt.Fprintln(os.Stderr, "\033[1;31m⚠️ CẢNH BÁO: Lệnh này sẽ XÓA TOÀN BỘ object cũ trong schema của DB đích trước khi restore! (--clean)")
+			fmt.Fprintln(os.Stderr, "   Xem mục 14.3 để biết rủi ro khi DB đích dùng chung schema cho nhiều app.\033[0m")
+		}
+
+		fmt.Println("Sẽ chạy:")
+		fmt.Printf("  %s\n\n", cmdString)
+
+		info, err := os.Stat(filePath)
+		fileSizeStr := "unknown"
+		if err == nil {
+			fileSizeStr = formatBytes(info.Size())
+		}
+
+		fmt.Printf("Profile:     %s (%s @ %s:%d/%s)\n", profile.Name, profile.Driver, profile.Host, profile.Port, profile.Database)
+		fmt.Printf("File:        %s (%s, format: %s)\n", filePath, fileSizeStr, finalFormat)
+		fmt.Printf("Jobs:        %d\n", restoreJobs)
+		cleanStr := "không"
+		if restoreClean {
+			cleanStr = "có"
+		}
+		fmt.Printf("Clean:       %s\n", cleanStr)
+		fmt.Println("\n(Không có gì được thực thi. Bỏ --dry-run để chạy thật.)")
+		return nil
+	}
+
+	// 6.5 Ensure database exists if requested
+	if restoreCreateIfMissing && !restoreDryRun {
+		fmt.Printf("Checking and ensuring target database '%s' exists...\n", profile.Database)
+		if err := drv.EnsureDatabaseExists(ctx, profile); err != nil {
+			return fmt.Errorf("failed to ensure database existence: %w", err)
+		}
+	}
+
+	// 7. Safety Validation
+	hasData, err := safety.CheckDatabaseHasData(ctx, profile.Host, profile.Port, profile.User, profile.Password, profile.Database)
+	if err != nil {
+		// If target DB check fails, warn but proceed with safety prompt
+		fmt.Printf("Warning: safety check could not inspect target database content: %v\n", err)
+		hasData = true
+	}
+
+	if hasData {
+		if restoreClean {
+			fmt.Fprintln(os.Stderr, "\033[1;31m⚠️ CẢNH BÁO: Lệnh này sẽ XÓA TOÀN BỘ object cũ trong schema của DB đích trước khi restore!\033[0m")
+		}
+		prompt := fmt.Sprintf("CSDL '%s' tại %s:%d đã có sẵn dữ liệu. Bạn có chắc chắn muốn ghi đè?", profile.Database, profile.Host, profile.Port)
+		if !safety.PromptConfirm(prompt) {
+			fmt.Println("Operation cancelled by user.")
+			return nil
+		}
+	}
+
+	// 8. Attach Execution Timeout Context
+	// We create a root command object internally just to parse the timeout config safely
+	tempCmd := &cobra.Command{}
+	runCtx, cancel, err := ContextWithTimeout(tempCmd, ctx)
+	if err != nil {
+		return err
+	}
+	defer cancel()
+
+	// 9. Execute Restore Subprocess
+	progressChan, err := drv.Restore(runCtx, opts)
+	if err != nil {
+		return err
+	}
+
+	var bar *progressbar.ProgressBar
+	if !Quiet && !Verbose {
+		bar = progressbar.NewOptions(100,
+			progressbar.OptionSetDescription("Restoring database"),
+			progressbar.OptionSetWriter(os.Stdout),
+			progressbar.OptionSetWidth(15),
+			progressbar.OptionThrottle(100*time.Millisecond),
+			progressbar.OptionShowCount(),
+			progressbar.OptionOnCompletion(func() {
+				fmt.Println()
+			}),
+		)
+	}
+
+	fmt.Println("Starting restore operation...")
+	var lastProgress driver.Progress
+	for p := range progressChan {
+		lastProgress = p
+		if !Quiet {
+			if Verbose || p.Err != nil || strings.Contains(p.Message, "[Database Error]") || p.Percent == 100 {
+				if bar != nil {
+					_ = bar.Clear()
+				}
+				fmt.Println(p.Message)
+			} else {
+				if bar != nil {
+					_ = bar.Set(int(p.Percent))
+				} else {
+					fmt.Printf("\r%-100s", p.Message)
+				}
+			}
+		}
+	}
+	if bar != nil {
+		_ = bar.Finish()
+	}
+	fmt.Println()
+
+	// 10. Record History Log
+	historyRec := history.HistoryRecord{
+		File:    filePath,
+		Profile: profile.Name,
+		Time:    time.Now(),
+		Success: lastProgress.Err == nil,
+		Command: cmdString,
+	}
+	if lastProgress.Err != nil {
+		historyRec.Error = lastProgress.Err.Error()
+	}
+	_ = history.AppendHistory(historyRec)
+
+	// Desktop Notification
+	if lastProgress.Err != nil {
+		_ = beeep.Notify("DBTool Restore Failed", fmt.Sprintf("Profile: %s\nError: %v", profile.Name, lastProgress.Err), "")
+		return lastProgress.Err
+	}
+	_ = beeep.Notify("DBTool Restore Success", fmt.Sprintf("Database %s restored successfully", profile.Database), "")
+
+	fmt.Println("✓ Database restore completed successfully.")
+	return nil
+}
+
 var restoreCmd = &cobra.Command{
 	Use:   "restore [file_or_directory]",
 	Short: "Restore a database from a dump archive or file",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		filePath := args[0]
-
-		// 1. Verify file exists and is readable early
-		if err := validateDumpFile(filePath); err != nil {
-			return err
-		}
-
-		// 2. Validate filter patterns early
-		for _, pat := range includeTable {
-			if err := postgres.ValidateTablePattern(pat); err != nil {
-				return err
-			}
-		}
-		for _, pat := range excludeTable {
-			if err := postgres.ValidateTablePattern(pat); err != nil {
-				return err
-			}
-		}
-		for _, pat := range includeSchema {
-			if err := postgres.ValidateTablePattern(pat); err != nil {
-				return err
-			}
-		}
-		for _, pat := range excludeSchema {
-			if err := postgres.ValidateTablePattern(pat); err != nil {
-				return err
-			}
-		}
-
-		// 3. Load profile configuration
-		cfg, err := config.LoadConfig()
-		if err != nil {
-			return err
-		}
-
-		profile, ok := cfg.GetProfile(restoreProfile)
-		if !ok {
-			return fmt.Errorf("profile %q not found in configurations", restoreProfile)
-		}
-
-		// 4. Retrieve database driver from registry
-		drv, err := driver.Get(profile.Driver)
-		if err != nil {
-			return err
-		}
-
-		// 5. Detect file format
-		detectedFormat, err := drv.DetectFormat(filePath)
-		if err != nil {
-			return fmt.Errorf("failed to detect dump format: %w", err)
-		}
-
-		fmt.Printf("Detected dump format: %s\n", detectedFormat)
-
-		// Set default format if not provided
-		finalFormat := driver.Format(restoreFormat)
-		if finalFormat == "" || finalFormat == "auto" {
-			finalFormat = detectedFormat
-		}
-
-		opts := driver.RestoreOptions{
-			Profile:         profile,
-			FilePath:        filePath,
-			Format:          finalFormat,
-			Jobs:            restoreJobs,
-			Clean:           restoreClean,
-			IncludeTable:    includeTable,
-			ExcludeTable:    excludeTable,
-			IncludeSchema:   includeSchema,
-			ExcludeSchema:   excludeSchema,
-			DryRun:          restoreDryRun,
-			CreateIfMissing: restoreCreateIfMissing,
-		}
-
-		cmdString := getDryRunCommand(opts)
-
-		// 6. Handle Dry Run
-		if restoreDryRun {
-			if restoreClean {
-				fmt.Fprintln(os.Stderr, "\033[1;31m⚠️ CẢNH BÁO: Lệnh này sẽ XÓA TOÀN BỘ object cũ trong schema của DB đích trước khi restore! (--clean)")
-				fmt.Fprintln(os.Stderr, "   Xem mục 14.3 để biết rủi ro khi DB đích dùng chung schema cho nhiều app.\033[0m")
-			}
-
-			fmt.Println("Sẽ chạy:")
-			fmt.Printf("  %s\n\n", cmdString)
-
-			info, err := os.Stat(filePath)
-			fileSizeStr := "unknown"
-			if err == nil {
-				fileSizeStr = formatBytes(info.Size())
-			}
-
-			fmt.Printf("Profile:     %s (%s @ %s:%d/%s)\n", profile.Name, profile.Driver, profile.Host, profile.Port, profile.Database)
-			fmt.Printf("File:        %s (%s, format: %s)\n", filePath, fileSizeStr, finalFormat)
-			fmt.Printf("Jobs:        %d\n", restoreJobs)
-			cleanStr := "không"
-			if restoreClean {
-				cleanStr = "có"
-			}
-			fmt.Printf("Clean:       %s\n", cleanStr)
-			fmt.Println("\n(Không có gì được thực thi. Bỏ --dry-run để chạy thật.)")
-			return nil
-		}
-
-		// 6.5 Ensure database exists if requested
-		if restoreCreateIfMissing && !restoreDryRun {
-			fmt.Printf("Checking and ensuring target database '%s' exists...\n", profile.Database)
-			if err := drv.EnsureDatabaseExists(cmd.Context(), profile); err != nil {
-				return fmt.Errorf("failed to ensure database existence: %w", err)
-			}
-		}
-
-		// 7. Safety Validation
-		hasData, err := safety.CheckDatabaseHasData(cmd.Context(), profile.Host, profile.Port, profile.User, profile.Password, profile.Database)
-		if err != nil {
-			// If target DB check fails, warn but proceed with safety prompt
-			fmt.Printf("Warning: safety check could not inspect target database content: %v\n", err)
-			hasData = true
-		}
-
-		if hasData {
-			if restoreClean {
-				fmt.Fprintln(os.Stderr, "\033[1;31m⚠️ CẢNH BÁO: Lệnh này sẽ XÓA TOÀN BỘ object cũ trong schema của DB đích trước khi restore!\033[0m")
-			}
-			prompt := fmt.Sprintf("CSDL '%s' tại %s:%d đã có sẵn dữ liệu. Bạn có chắc chắn muốn ghi đè?", profile.Database, profile.Host, profile.Port)
-			if !safety.PromptConfirm(prompt) {
-				fmt.Println("Operation cancelled by user.")
-				return nil
-			}
-		}
-
-		// 8. Attach Execution Timeout Context
-		runCtx, cancel, err := ContextWithTimeout(cmd, cmd.Context())
-		if err != nil {
-			return err
-		}
-		defer cancel()
-
-		// 9. Execute Restore Subprocess
-		progressChan, err := drv.Restore(runCtx, opts)
-		if err != nil {
-			return err
-		}
-
-		var bar *progressbar.ProgressBar
-		if !Quiet && !Verbose {
-			bar = progressbar.NewOptions(100,
-				progressbar.OptionSetDescription("Restoring database"),
-				progressbar.OptionSetWriter(os.Stdout),
-				progressbar.OptionSetWidth(15),
-				progressbar.OptionThrottle(100*time.Millisecond),
-				progressbar.OptionShowCount(),
-				progressbar.OptionOnCompletion(func() {
-					fmt.Println()
-				}),
-			)
-		}
-
-		fmt.Println("Starting restore operation...")
-		var lastProgress driver.Progress
-		for p := range progressChan {
-			lastProgress = p
-			if !Quiet {
-				if Verbose || p.Err != nil || strings.Contains(p.Message, "[Database Error]") || p.Percent == 100 {
-					if bar != nil {
-						_ = bar.Clear()
-					}
-					fmt.Println(p.Message)
-				} else {
-					if bar != nil {
-						_ = bar.Set(int(p.Percent))
-					} else {
-						fmt.Printf("\r%-100s", p.Message)
-					}
-				}
-			}
-		}
-		if bar != nil {
-			_ = bar.Finish()
-		}
-		fmt.Println()
-
-		// 10. Record History Log
-		historyRec := history.HistoryRecord{
-			File:    filePath,
-			Profile: profile.Name,
-			Time:    time.Now(),
-			Success: lastProgress.Err == nil,
-			Command: cmdString,
-		}
-		if lastProgress.Err != nil {
-			historyRec.Error = lastProgress.Err.Error()
-		}
-		_ = history.AppendHistory(historyRec)
-
-		// Desktop Notification
-		if lastProgress.Err != nil {
-			_ = beeep.Notify("DBTool Restore Failed", fmt.Sprintf("Profile: %s\nError: %v", profile.Name, lastProgress.Err), "")
-			return lastProgress.Err
-		}
-		_ = beeep.Notify("DBTool Restore Success", fmt.Sprintf("Database %s restored successfully", profile.Database), "")
-
-		fmt.Println("✓ Database restore completed successfully.")
-		return nil
+		return ExecuteRestoreLogic(cmd.Context(), args[0])
 	},
 }
 

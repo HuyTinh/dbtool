@@ -16,7 +16,7 @@ var (
 	Quiet   bool
 	Verbose bool
 	Timeout string
-	Version = "v0.0.2"
+	Version = "v0.0.3"
 	Commit  = "none"
 	Date    = "unknown"
 )

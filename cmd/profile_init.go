@@ -8,6 +8,8 @@ import (
 
 	"dbtool/internal/config"
 	"dbtool/internal/importer"
+	_ "dbtool/internal/importer/dockercompose"
+	_ "dbtool/internal/importer/dotenv"
 	_ "dbtool/internal/importer/springboot"
 
 	"github.com/spf13/cobra"
