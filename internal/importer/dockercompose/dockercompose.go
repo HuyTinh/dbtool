@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"dbtool/internal/config"
 	"dbtool/internal/importer"
 
 	"gopkg.in/yaml.v3"
@@ -58,9 +59,11 @@ type ComposeFile struct {
 }
 
 type ComposeService struct {
-	Image       string      `yaml:"image"`
-	Ports       []interface{} `yaml:"ports"`
-	Environment interface{} `yaml:"environment"`
+	Image         string        `yaml:"image"`
+	ContainerName string        `yaml:"container_name"`
+	Ports         []interface{} `yaml:"ports"`
+	Environment   interface{}   `yaml:"environment"`
+	Volumes       []interface{} `yaml:"volumes"`
 }
 
 func (d *DockerComposeImporter) Parse(filePath string) ([]importer.ImportedProfile, error) {
@@ -85,6 +88,7 @@ func (d *DockerComposeImporter) Parse(filePath string) ([]importer.ImportedProfi
 		}
 
 		envMap := parseEnvironment(service.Environment)
+		mounts := parseVolumes(service.Volumes, filePath)
 		hostPort, containerPort := parsePorts(service.Ports, dbType)
 
 		// Extract credentials depending on database type
@@ -151,6 +155,14 @@ func (d *DockerComposeImporter) Parse(filePath string) ([]importer.ImportedProfi
 			Password:      pass,
 			PasswordIsRef: isRef(pass),
 			Source:        fmt.Sprintf("%s -> service %q", filepath.Base(filePath), serviceName),
+			Runtime: &config.RuntimeProfile{
+				Type:        "docker",
+				Source:      "docker-compose",
+				SourceFile:  filePath,
+				ServiceName: serviceName,
+				Container:   service.ContainerName,
+				Mounts:      mounts,
+			},
 		})
 	}
 
@@ -223,6 +235,114 @@ func parseEnvironment(env interface{}) map[string]string {
 	}
 	return res
 }
+
+func parseVolumes(raw []interface{}, composeFile string) []config.MountMapping {
+	if len(raw) == 0 {
+		return nil
+	}
+	composeDir := filepath.Dir(composeFile)
+	mounts := make([]config.MountMapping, 0, len(raw))
+	for _, item := range raw {
+		switch v := item.(type) {
+		case string:
+			if mount, ok := parseShortVolume(v, composeDir); ok {
+				mounts = append(mounts, mount)
+			}
+		case map[string]interface{}:
+			if mount, ok := parseLongVolume(v, composeDir); ok {
+				mounts = append(mounts, mount)
+			}
+		}
+	}
+	return mounts
+}
+
+func parseShortVolume(raw, composeDir string) (config.MountMapping, bool) {
+	source, target, ok := splitShortVolume(strings.TrimSpace(raw))
+	if !ok || target == "" {
+		return config.MountMapping{}, false
+	}
+	mountType := inferVolumeType(source)
+	if mountType == "bind" {
+		source = normalizeBindSource(source, composeDir)
+	}
+	return config.MountMapping{Type: mountType, Source: source, Target: target}, true
+}
+
+func splitShortVolume(raw string) (source, target string, ok bool) {
+	parts := strings.Split(raw, ":")
+	if len(parts) < 2 {
+		return "", "", false
+	}
+	last := parts[len(parts)-1]
+	if isVolumeMode(last) && len(parts) >= 3 {
+		target = parts[len(parts)-2]
+		source = strings.Join(parts[:len(parts)-2], ":")
+	} else {
+		target = last
+		source = strings.Join(parts[:len(parts)-1], ":")
+	}
+	return strings.TrimSpace(source), strings.TrimSpace(target), true
+}
+
+func parseLongVolume(raw map[string]interface{}, composeDir string) (config.MountMapping, bool) {
+	source := mapString(raw, "source")
+	target := mapString(raw, "target")
+	if target == "" {
+		return config.MountMapping{}, false
+	}
+	mountType := mapString(raw, "type")
+	if mountType == "" {
+		mountType = inferVolumeType(source)
+	}
+	if mountType == "bind" {
+		source = normalizeBindSource(source, composeDir)
+	}
+	return config.MountMapping{Type: mountType, Source: source, Target: target}, true
+}
+
+func mapString(raw map[string]interface{}, key string) string {
+	value, ok := raw[key]
+	if !ok || value == nil {
+		return ""
+	}
+	return strings.TrimSpace(fmt.Sprintf("%v", value))
+}
+
+func inferVolumeType(source string) string {
+	if source == "" {
+		return "unknown"
+	}
+	if filepath.IsAbs(source) || strings.HasPrefix(source, ".") || strings.HasPrefix(source, "~") || strings.ContainsAny(source, `/\\`) || windowsDrivePattern.MatchString(source) {
+		return "bind"
+	}
+	return "volume"
+}
+
+func normalizeBindSource(source, composeDir string) string {
+	if source == "" || filepath.IsAbs(source) || windowsDrivePattern.MatchString(source) {
+		return filepath.Clean(source)
+	}
+	return filepath.Clean(filepath.Join(composeDir, source))
+}
+
+func isVolumeMode(value string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.HasPrefix(value, "/") || strings.HasPrefix(value, "\\") || windowsDrivePattern.MatchString(value) {
+		return false
+	}
+	for _, mode := range strings.Split(strings.ToLower(value), ",") {
+		switch mode {
+		case "ro", "rw", "z", "cached", "delegated", "consistent", "nocopy":
+			continue
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+var windowsDrivePattern = regexp.MustCompile(`^[A-Za-z]:[\\/]`)
 
 func parsePorts(ports []interface{}, dbType string) (hostPort int, containerPort int) {
 	defaultContainerPort := 5432

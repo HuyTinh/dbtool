@@ -72,7 +72,7 @@ var profileInitCmd = &cobra.Command{
 					}
 
 					profileName := promptString("Enter profile name", p.SuggestedName)
-					
+
 					newProfile := config.Profile{
 						Driver:   p.Driver,
 						Host:     p.Host,
@@ -80,6 +80,7 @@ var profileInitCmd = &cobra.Command{
 						User:     p.Username,
 						Database: p.Database,
 						Password: p.Password,
+						Runtime:  p.Runtime,
 					}
 
 					if err := cfg.SaveProfile(profileName, newProfile); err != nil {
@@ -126,7 +127,7 @@ func promptConfirm(prompt string) bool {
 
 func init() {
 	profileInitCmd.Flags().StringVar(&profileInitFrom, "from", ".", "Directory to scan for configuration files")
-	
+
 	// Register under profile command (dbtool profile init)
 	profileCmd.AddCommand(profileInitCmd)
 }

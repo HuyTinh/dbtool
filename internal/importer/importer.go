@@ -3,6 +3,8 @@ package importer
 import (
 	"fmt"
 	"sync"
+
+	"dbtool/internal/config"
 )
 
 type ImportedProfile struct {
@@ -15,6 +17,7 @@ type ImportedProfile struct {
 	Password      string
 	PasswordIsRef bool
 	Source        string // description of source file/key, e.g. "application.yml -> spring.datasource.url"
+	Runtime       *config.RuntimeProfile
 }
 
 type Importer interface {

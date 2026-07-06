@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
+	stdruntime "runtime"
 	"strings"
 	"time"
 
 	"dbtool/internal/config"
 	"dbtool/internal/pitr"
+	dbtruntime "dbtool/internal/runtime"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/spf13/cobra"
@@ -140,10 +141,12 @@ func runPITRSetup(ctx context.Context) error {
 	archiveCommand := settings["archive_command"]
 	dataDirectory := settings["data_directory"]
 	hbaFile := settings["hba_file"]
-	effectiveHBAFile := hbaFile
-	if pitrSetupPGHBAFile != "" {
-		effectiveHBAFile = pitrSetupPGHBAFile
-	}
+	detection := dbtruntime.BuildDetectionFromSettings(profile, dbtruntime.PostgresSettings{
+		DataDirectory: dataDirectory,
+		HBAFile:       hbaFile,
+	})
+	effectiveHBAFile := selectEffectiveHBAFile(pitrSetupPGHBAFile, hbaFile, detection)
+	printRuntimeDetection(detection, hbaFile, pitrSetupPGHBAFile)
 
 	// Step 3: Create PITR directories
 	profilePITRDir, err := pitr.GetProfilePITRDir(pitrSetupProfile)
@@ -178,7 +181,7 @@ func runPITRSetup(ctx context.Context) error {
 
 	// Step 4: Generate archive_command
 	var generatedArchiveCommand string
-	if runtime.GOOS == "windows" {
+	if stdruntime.GOOS == "windows" {
 		generatedArchiveCommand = fmt.Sprintf(`copy "%%p" "%s\%%f"`, archiveDir)
 	} else {
 		generatedArchiveCommand = fmt.Sprintf("cp %%p %s/%%f", archiveDir)
@@ -388,6 +391,45 @@ func runPITRSetup(ctx context.Context) error {
 
 	fmt.Printf("\n✓ PITR configuration saved to %s\n", filepath.Join(profilePITRDir, "config.yaml"))
 	return nil
+}
+
+func selectEffectiveHBAFile(explicitPath, postgresHBAFile string, detection dbtruntime.DetectionResult) string {
+	if explicitPath != "" {
+		return explicitPath
+	}
+	if detection.HBAEditable && detection.HBAHostPath != "" {
+		return detection.HBAHostPath
+	}
+	return postgresHBAFile
+}
+
+func printRuntimeDetection(detection dbtruntime.DetectionResult, postgresHBAFile, explicitPath string) {
+	if detection.Runtime == nil || detection.Runtime.Type == "" {
+		return
+	}
+
+	fmt.Println("  Runtime detection:")
+	fmt.Printf("    type: %s\n", detection.Runtime.Type)
+	if detection.Runtime.Source != "" {
+		fmt.Printf("    source: %s\n", detection.Runtime.Source)
+	}
+	if detection.Runtime.ServiceName != "" {
+		fmt.Printf("    service: %s\n", detection.Runtime.ServiceName)
+	}
+	if postgresHBAFile != "" {
+		fmt.Printf("    PostgreSQL hba_file: %s\n", postgresHBAFile)
+	}
+	if explicitPath != "" {
+		fmt.Printf("    pg_hba.conf edit path: %s (explicit override)\n", explicitPath)
+		return
+	}
+	if detection.HBAEditable && detection.HBAHostPath != "" {
+		fmt.Printf("    host pg_hba.conf: %s (bind mount)\n", detection.HBAHostPath)
+		return
+	}
+	if detection.HBAMatched && detection.HBAReason != "" {
+		fmt.Printf("    pg_hba.conf host edit: unavailable (%s)\n", detection.HBAReason)
+	}
 }
 
 func CheckReplicationPrerequisites(ctx context.Context, conn *pgx.Conn) error {
