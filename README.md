@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="./icon.svg" alt="dbtool icon" width="96" height="96">
+</p>
+
 # dbtool
 
 `dbtool` là một công cụ CLI viết bằng Go để quản lý sao lưu và khôi phục cơ sở dữ liệu PostgreSQL. Nó cung cấp một giao diện thống nhất, hỗ trợ nhiều profile kết nối, lọc schema/table linh hoạt và ghi lại lịch sử thao tác.
