@@ -12,6 +12,7 @@ import (
 	"dbtool/internal/driver"
 	"dbtool/internal/driver/postgres"
 	"dbtool/internal/history"
+	"dbtool/internal/integrity"
 	"dbtool/internal/safety"
 
 	"github.com/gen2brain/beeep"
@@ -27,6 +28,9 @@ var (
 	restoreDryRun          bool
 	restoreCreateIfMissing bool
 	restoreOptimize        bool
+	restoreSkipChecksum    bool
+	restoreVerify          bool
+	restoreVerifyPost      bool
 	includeTable           []string
 	excludeTable           []string
 	includeSchema          []string
@@ -37,6 +41,27 @@ func ExecuteRestoreLogic(ctx context.Context, filePath string) error {
 	// 1. Verify file exists and is readable early
 	if err := validateDumpFile(filePath); err != nil {
 		return err
+	}
+
+	// 1.5 Verify dump file integrity via checksum sidecar
+	if !restoreSkipChecksum {
+		stored, _ := integrity.ReadChecksumFile(filePath)
+		if stored == "" {
+			fmt.Println("No checksum sidecar found, skipping integrity verification.")
+		} else {
+			fmt.Print("Verifying dump file integrity... ")
+			ok, err := integrity.VerifyChecksum(filePath)
+			if err != nil {
+				fmt.Println("FAILED")
+				fmt.Fprintf(os.Stderr, "⚠ %v\n", err)
+				if !safety.PromptConfirm("Checksum verification failed. Continue restore anyway?") {
+					fmt.Println("Operation cancelled by user.")
+					return nil
+				}
+			} else if ok {
+				fmt.Printf("OK (%s)\n", stored[:12]+"...")
+			}
+		}
 	}
 
 	// 2. Validate filter patterns early
@@ -107,6 +132,28 @@ func ExecuteRestoreLogic(ctx context.Context, filePath string) error {
 	}
 
 	cmdString := getDryRunCommand(opts)
+
+	// 5.5 Handle --verify (pre-restore validation only)
+	if restoreVerify {
+		fmt.Println("\nVerifying dump file...")
+		valResult, valErr := drv.ValidateDump(ctx, driver.ValidateOptions{
+			FilePath:      filePath,
+			Format:        finalFormat,
+			Profile:       profile,
+			IncludeTable:  includeTable,
+			ExcludeTable:  excludeTable,
+			IncludeSchema: includeSchema,
+			ExcludeSchema: excludeSchema,
+		})
+		if valErr != nil {
+			return fmt.Errorf("validation failed: %w", valErr)
+		}
+		printValidationResult(valResult)
+		if len(valResult.Errors) > 0 {
+			return fmt.Errorf("dump validation found %d error(s)", len(valResult.Errors))
+		}
+		return nil
+	}
 
 	// 6. Handle Dry Run
 	if restoreDryRun {
@@ -248,6 +295,28 @@ func ExecuteRestoreLogic(ctx context.Context, filePath string) error {
 		}
 	}
 
+	// Post-restore verification
+	if restoreVerifyPost {
+		fmt.Println("\nVerifying restored database...")
+		verifyResult, verifyErr := drv.VerifyRestore(runCtx, driver.VerifyRestoreOptions{
+			Profile:       profile,
+			FilePath:      filePath,
+			Format:        finalFormat,
+			IncludeTable:  includeTable,
+			ExcludeTable:  excludeTable,
+			IncludeSchema: includeSchema,
+			ExcludeSchema: excludeSchema,
+		})
+		if verifyErr != nil {
+			fmt.Fprintf(os.Stderr, "⚠ Warning: post-restore verification failed: %v\n", verifyErr)
+		} else {
+			printVerifyResult(verifyResult)
+			if !verifyResult.Verified {
+				return fmt.Errorf("post-restore verification found issues")
+			}
+		}
+	}
+
 	return nil
 }
 
@@ -319,6 +388,145 @@ func getDryRunCommand(opts driver.RestoreOptions) string {
 		opts.Profile.Host, opts.Profile.Port, opts.Profile.User, opts.Profile.Database, jobsFlag, cleanFlag, filterFlags, opts.FilePath)
 }
 
+func printValidationResult(r *driver.ValidationResult) {
+	fmt.Println(strings.Repeat("=", 50))
+	fmt.Println("Dump Validation Report")
+	fmt.Println(strings.Repeat("=", 50))
+
+	if r.HasTOC {
+		fmt.Printf("  Tables:  %d\n", r.TableCount)
+		fmt.Printf("  Views:   %d\n", r.ViewCount)
+		if len(r.SchemaNames) > 0 {
+			fmt.Printf("  Schemas: %s\n", strings.Join(r.SchemaNames, ", "))
+		}
+	} else {
+		fmt.Println("  TOC: not available (plain text format or parse error)")
+	}
+
+	if r.DumpPGVersion != "" {
+		fmt.Printf("  Dump PG version:   %s\n", r.DumpPGVersion)
+	}
+	if r.TargetPGVersion != "" {
+		fmt.Printf("  Target PG version: %s\n", r.TargetPGVersion)
+	}
+	if r.DumpPGVersion != "" && r.TargetPGVersion != "" {
+		if r.SchemaCompatible {
+			fmt.Println("  Version compatibility: OK")
+		} else {
+			fmt.Println("  Version compatibility: INCOMPATIBLE")
+		}
+	}
+
+	hasFilters := len(r.FilterMatches.IncludeTableMatched) > 0 ||
+		len(r.FilterMatches.IncludeTableUnmatched) > 0 ||
+		len(r.FilterMatches.ExcludeTableMatched) > 0 ||
+		len(r.FilterMatches.ExcludeTableUnmatched) > 0 ||
+		len(r.FilterMatches.IncludeSchemaMatched) > 0 ||
+		len(r.FilterMatches.IncludeSchemaUnmatched) > 0 ||
+		len(r.FilterMatches.ExcludeSchemaMatched) > 0 ||
+		len(r.FilterMatches.ExcludeSchemaUnmatched) > 0
+
+	if hasFilters {
+		fmt.Println("\n  Filter pre-flight:")
+		for _, p := range r.FilterMatches.IncludeTableMatched {
+			fmt.Printf("    --include-table %s  -> matched\n", p)
+		}
+		for _, p := range r.FilterMatches.IncludeTableUnmatched {
+			fmt.Printf("    --include-table %s  -> NO MATCH\n", p)
+		}
+		for _, p := range r.FilterMatches.ExcludeTableMatched {
+			fmt.Printf("    --exclude-table %s  -> matched\n", p)
+		}
+		for _, p := range r.FilterMatches.ExcludeTableUnmatched {
+			fmt.Printf("    --exclude-table %s  -> NO MATCH\n", p)
+		}
+		for _, p := range r.FilterMatches.IncludeSchemaMatched {
+			fmt.Printf("    --include-schema %s  -> matched\n", p)
+		}
+		for _, p := range r.FilterMatches.IncludeSchemaUnmatched {
+			fmt.Printf("    --include-schema %s  -> NO MATCH\n", p)
+		}
+		for _, p := range r.FilterMatches.ExcludeSchemaMatched {
+			fmt.Printf("    --exclude-schema %s  -> matched\n", p)
+		}
+		for _, p := range r.FilterMatches.ExcludeSchemaUnmatched {
+			fmt.Printf("    --exclude-schema %s  -> NO MATCH\n", p)
+		}
+	}
+
+	if len(r.Warnings) > 0 {
+		fmt.Println("\n  Warnings:")
+		for _, w := range r.Warnings {
+			fmt.Printf("    - %s\n", w)
+		}
+	}
+	if len(r.Errors) > 0 {
+		fmt.Println("\n  Errors:")
+		for _, e := range r.Errors {
+			fmt.Printf("    - %s\n", e)
+		}
+	}
+
+	fmt.Println(strings.Repeat("=", 50))
+	if len(r.Errors) == 0 && len(r.Warnings) == 0 {
+		fmt.Println("Dump is valid for restore.")
+	} else if len(r.Errors) == 0 {
+		fmt.Println("Dump is valid with warnings.")
+	}
+}
+
+func printVerifyResult(r *driver.VerifyResult) {
+	fmt.Println(strings.Repeat("=", 50))
+	fmt.Println("Post-restore Verification Report")
+	fmt.Println(strings.Repeat("=", 50))
+
+	if r.TablesExpected > 0 {
+		fmt.Printf("  Tables expected: %d\n", r.TablesExpected)
+	}
+	fmt.Printf("  Tables found:    %d\n", r.TablesFound)
+
+	if len(r.MissingTables) > 0 {
+		fmt.Println("\n  Missing tables:")
+		for _, t := range r.MissingTables {
+			fmt.Printf("    - %s\n", t)
+		}
+	}
+
+	if len(r.RowCounts) > 0 {
+		fmt.Printf("\n  Row counts (%d tables sampled):\n", len(r.RowCounts))
+		for _, rc := range r.RowCounts {
+			fmt.Printf("    %s.%s: %d rows\n", rc.Schema, rc.Table, rc.RowCount)
+		}
+	}
+
+	if len(r.SampleFailed) > 0 {
+		fmt.Println("\n  Sample query failed:")
+		for _, t := range r.SampleFailed {
+			fmt.Printf("    - %s\n", t)
+		}
+	}
+
+	if len(r.Warnings) > 0 {
+		fmt.Println("\n  Warnings:")
+		for _, w := range r.Warnings {
+			fmt.Printf("    - %s\n", w)
+		}
+	}
+	if len(r.Errors) > 0 {
+		fmt.Println("\n  Errors:")
+		for _, e := range r.Errors {
+			fmt.Printf("    - %s\n", e)
+		}
+	}
+
+	fmt.Println(strings.Repeat("=", 50))
+	if r.Verified {
+		fmt.Println("✓ Post-restore verification passed.")
+	} else {
+		fmt.Println("✗ Post-restore verification found issues.")
+	}
+}
+
 func init() {
 	restoreCmd.Flags().StringVar(&restoreProfile, "profile", "", "Profile name to restore into")
 	restoreCmd.Flags().StringVar(&restoreFormat, "format", "auto", "Format of dump file (auto, custom, plain, directory)")
@@ -327,6 +535,9 @@ func init() {
 	restoreCmd.Flags().BoolVar(&restoreDryRun, "dry-run", false, "Show details and the native command that would run")
 	restoreCmd.Flags().BoolVar(&restoreCreateIfMissing, "create-if-missing", false, "Create the target database if it does not exist")
 	restoreCmd.Flags().BoolVar(&restoreOptimize, "optimize", false, "Run VACUUM ANALYZE after restore to optimize database")
+	restoreCmd.Flags().BoolVar(&restoreSkipChecksum, "skip-checksum", false, "Skip checksum verification before restore")
+	restoreCmd.Flags().BoolVar(&restoreVerify, "verify", false, "Validate dump file (TOC, schema compatibility, filters) without restoring")
+	restoreCmd.Flags().BoolVar(&restoreVerifyPost, "verify-post", false, "Verify restored database after completion (table existence, row counts, sample queries)")
 	restoreCmd.Flags().StringSliceVar(&includeTable, "include-table", nil, "Restore specific table (can be repeated)")
 	restoreCmd.Flags().StringSliceVar(&excludeTable, "exclude-table", nil, "Exclude specific table (can be repeated)")
 	restoreCmd.Flags().StringSliceVar(&includeSchema, "include-schema", nil, "Restore specific schema (can be repeated)")

@@ -10,6 +10,7 @@ import (
 	"dbtool/internal/driver"
 	"dbtool/internal/driver/postgres"
 	"dbtool/internal/history"
+	"dbtool/internal/integrity"
 	"dbtool/internal/safety"
 
 	"github.com/gen2brain/beeep"
@@ -27,6 +28,7 @@ var (
 	migrateJobs            int
 	migrateKeepTemp        bool
 	migrateOptimize        bool
+	migrateVerifyPost      bool
 	migrateIncludeTable    []string
 	migrateExcludeTable    []string
 	migrateIncludeSchema   []string
@@ -49,6 +51,7 @@ var migrateCmd = &cobra.Command{
 			Jobs:            migrateJobs,
 			KeepTemp:        migrateKeepTemp,
 			Optimize:        migrateOptimize,
+			VerifyPost:      migrateVerifyPost,
 			IncludeTable:    migrateIncludeTable,
 			ExcludeTable:    migrateExcludeTable,
 			IncludeSchema:   migrateIncludeSchema,
@@ -70,6 +73,7 @@ type MigrateOptions struct {
 	Jobs            int
 	KeepTemp        bool
 	Optimize        bool
+	VerifyPost      bool
 	IncludeTable    []string
 	ExcludeTable    []string
 	IncludeSchema   []string
@@ -216,6 +220,55 @@ func ExecuteMigrateLogic(ctx context.Context, opts MigrateOptions) error {
 		Command: "migrate(dump): " + dumpCmdStr,
 	})
 
+	// === Verify dump integrity before restore ===
+	fmt.Println()
+	fmt.Print("Verifying dump integrity... ")
+	checksum, checksumErr := integrity.ComputeFileChecksum(tempPath)
+	if checksumErr != nil {
+		fmt.Println("WARNING (cannot compute checksum)")
+		fmt.Fprintf(os.Stderr, "⚠ %v\n", checksumErr)
+	} else {
+		fmt.Printf("OK (%s)\n", checksum[:12]+"...")
+	}
+
+	// === Pre-restore validation ===
+	fmt.Println()
+	fmt.Println("Validating dump for target compatibility...")
+	detectedFormat, detectErr := drv.DetectFormat(tempPath)
+	if detectErr != nil || detectedFormat == driver.FormatUnknown {
+		detectedFormat = format
+	}
+	valResult, valErr := drv.ValidateDump(ctx, driver.ValidateOptions{
+		FilePath:      tempPath,
+		Format:        detectedFormat,
+		Profile:       dst,
+		IncludeTable:  opts.IncludeTable,
+		ExcludeTable:  opts.ExcludeTable,
+		IncludeSchema: opts.IncludeSchema,
+		ExcludeSchema: opts.ExcludeSchema,
+	})
+	if valErr != nil {
+		fmt.Fprintf(os.Stderr, "⚠ Warning: validation check failed: %v\n", valErr)
+	} else {
+		for _, w := range valResult.Warnings {
+			fmt.Fprintf(os.Stderr, "⚠ %s\n", w)
+		}
+		if len(valResult.Errors) > 0 {
+			for _, e := range valResult.Errors {
+				fmt.Fprintf(os.Stderr, "✗ %s\n", e)
+			}
+			_ = beeep.Notify("DBTool Migrate Failed", "Pre-restore validation found errors", "")
+			return fmt.Errorf("pre-restore validation found %d error(s), aborting", len(valResult.Errors))
+		}
+		if valResult.HasTOC {
+			fmt.Printf("  TOC: %d tables, %d views\n", valResult.TableCount, valResult.ViewCount)
+		}
+		if valResult.DumpPGVersion != "" && valResult.TargetPGVersion != "" {
+			fmt.Printf("  Version: dump=%s target=%s (compatible: %v)\n",
+				valResult.DumpPGVersion, valResult.TargetPGVersion, valResult.SchemaCompatible)
+		}
+	}
+
 	// === Safety check on target ===
 	fmt.Println()
 	fmt.Println("Checking target database...")
@@ -246,15 +299,15 @@ func ExecuteMigrateLogic(ctx context.Context, opts MigrateOptions) error {
 	fmt.Println()
 	fmt.Println("[2/2] Restoring into target...")
 
-	detectedFormat, err := drv.DetectFormat(tempPath)
-	if err != nil || detectedFormat == driver.FormatUnknown {
-		detectedFormat = format
+	detectedFormat2, err := drv.DetectFormat(tempPath)
+	if err != nil || detectedFormat2 == driver.FormatUnknown {
+		detectedFormat2 = format
 	}
 
 	restoreOpts := driver.RestoreOptions{
 		Profile:         dst,
 		FilePath:        tempPath,
-		Format:          detectedFormat,
+		Format:          detectedFormat2,
 		Jobs:            opts.Jobs,
 		Clean:           opts.Clean,
 		IncludeTable:    opts.IncludeTable,
@@ -319,6 +372,29 @@ func ExecuteMigrateLogic(ctx context.Context, opts MigrateOptions) error {
 		}
 	}
 
+	// Post-migrate verification
+	if opts.VerifyPost {
+		fmt.Println("\nVerifying migrated database...")
+		verifyResult, verifyErr := drv.VerifyRestore(ctx, driver.VerifyRestoreOptions{
+			Profile:       dst,
+			FilePath:      tempPath,
+			Format:        detectedFormat2,
+			IncludeTable:  opts.IncludeTable,
+			ExcludeTable:  opts.ExcludeTable,
+			IncludeSchema: opts.IncludeSchema,
+			ExcludeSchema: opts.ExcludeSchema,
+		})
+		if verifyErr != nil {
+			fmt.Fprintf(os.Stderr, "⚠ Warning: post-migrate verification failed: %v\n", verifyErr)
+		} else {
+			printVerifyResult(verifyResult)
+			if !verifyResult.Verified {
+				_ = beeep.Notify("DBTool Migrate Warning", "Post-migrate verification found issues", "")
+				return fmt.Errorf("post-migrate verification found issues")
+			}
+		}
+	}
+
 	if opts.KeepTemp {
 		fmt.Printf("Temp dump kept at: %s\n", tempPath)
 	}
@@ -360,6 +436,7 @@ func init() {
 	migrateCmd.Flags().IntVarP(&migrateJobs, "jobs", "j", defaultJobs(), "Parallel restore jobs (directory format only)")
 	migrateCmd.Flags().BoolVar(&migrateKeepTemp, "keep-temp", false, "Keep the intermediate dump file after migration")
 	migrateCmd.Flags().BoolVar(&migrateOptimize, "optimize", false, "Run VACUUM ANALYZE on target after migration")
+	migrateCmd.Flags().BoolVar(&migrateVerifyPost, "verify-post", false, "Verify migrated database after completion (table existence, row counts, sample queries)")
 	migrateCmd.Flags().StringSliceVar(&migrateIncludeTable, "include-table", nil, "Include specific table (can be repeated)")
 	migrateCmd.Flags().StringSliceVar(&migrateExcludeTable, "exclude-table", nil, "Exclude specific table (can be repeated)")
 	migrateCmd.Flags().StringSliceVar(&migrateIncludeSchema, "include-schema", nil, "Include specific schema (can be repeated)")

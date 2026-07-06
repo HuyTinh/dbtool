@@ -53,7 +53,15 @@ func (d *PostgresDriver) SetupArchive(ctx context.Context, profile config.Profil
 
 	// Set archive_command
 	archiveCmd := fmt.Sprintf("cp %%p %s/%%f", archiveDir)
-	_, err = conn.Exec(ctx, "ALTER SYSTEM SET archive_command = $1", archiveCmd)
+
+	// Escape dấu nháy đơn để an toàn trong SQL literal
+	escapedArchiveCmd := strings.ReplaceAll(archiveCmd, "'", "''")
+
+	query := fmt.Sprintf(
+		"ALTER SYSTEM SET archive_command = '%s'",
+		escapedArchiveCmd,
+	)
+	_, err = conn.Exec(ctx, query)
 	if err != nil {
 		return fmt.Errorf("cannot set archive_command: %w", err)
 	}

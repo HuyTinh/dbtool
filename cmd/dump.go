@@ -10,6 +10,7 @@ import (
 	"dbtool/internal/driver"
 	"dbtool/internal/driver/postgres"
 	"dbtool/internal/history"
+	"dbtool/internal/integrity"
 
 	"github.com/gen2brain/beeep"
 	"github.com/schollz/progressbar/v3"
@@ -156,6 +157,17 @@ func ExecuteDumpLogic(ctx context.Context, filePath string) error {
 	if lastProgress.Err != nil {
 		historyRec.Error = lastProgress.Err.Error()
 	}
+
+	if lastProgress.Err == nil {
+		if checksum, err := integrity.ComputeFileChecksum(filePath); err == nil {
+			historyRec.Checksum = checksum
+			_ = integrity.WriteChecksumFile(filePath, checksum)
+		}
+		if size, err := integrity.FileSize(filePath); err == nil {
+			historyRec.FileSize = size
+		}
+	}
+
 	_ = history.AppendHistory(historyRec)
 
 	if lastProgress.Err != nil {
@@ -165,6 +177,12 @@ func ExecuteDumpLogic(ctx context.Context, filePath string) error {
 	_ = beeep.Notify("DBTool Dump Success", fmt.Sprintf("Database %s dumped to %s", profile.Database, filePath), "")
 
 	fmt.Println("✓ Database dump completed successfully.")
+	if historyRec.Checksum != "" {
+		fmt.Printf("  Checksum: %s\n", historyRec.Checksum)
+	}
+	if historyRec.FileSize > 0 {
+		fmt.Printf("  Size: %s\n", formatBytes(historyRec.FileSize))
+	}
 	return nil
 }
 
