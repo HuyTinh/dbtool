@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 )
@@ -258,5 +259,168 @@ func TestBaseBackupMetadata_SizeFormatting(t *testing.T) {
 		if metadata.Size != tt.size {
 			t.Errorf("Size = %v, want %v", metadata.Size, tt.size)
 		}
+	}
+}
+
+func TestBaseBackupSuggestion_PgHBAReplicationFailure(t *testing.T) {
+	stderr := `pg_basebackup: error: connection to server at "localhost" (::1), port 5447 failed: FATAL:  no pg_hba.conf entry for replication connection from host "172.23.0.1", user "postgres", no encryption`
+
+	suggestion := BaseBackupSuggestion(stderr)
+
+	for _, want := range []string{
+		"pg_hba.conf",
+		"replication",
+		"postgres",
+		"172.23.0.1/32",
+		"SELECT pg_reload_conf();",
+	} {
+		if !strings.Contains(suggestion, want) {
+			t.Fatalf("BaseBackupSuggestion() = %q, want it to contain %q", suggestion, want)
+		}
+	}
+}
+
+func TestBaseBackupSuggestion_ReplicationPrivilegeFailure(t *testing.T) {
+	stderr := `pg_basebackup: error: must be superuser or replication role to start walsender`
+
+	suggestion := BaseBackupSuggestion(stderr)
+
+	for _, want := range []string{
+		"REPLICATION privilege",
+		"ALTER ROLE",
+	} {
+		if !strings.Contains(suggestion, want) {
+			t.Fatalf("BaseBackupSuggestion() = %q, want it to contain %q", suggestion, want)
+		}
+	}
+}
+
+func TestBaseBackupSuggestion_UnrelatedError(t *testing.T) {
+	stderr := `pg_basebackup: error: could not create directory "backup": Permission denied`
+
+	if suggestion := BaseBackupSuggestion(stderr); suggestion != "" {
+		t.Fatalf("BaseBackupSuggestion() = %q, want empty suggestion", suggestion)
+	}
+}
+
+func TestReplicationPgHBARule_IPv4(t *testing.T) {
+	rule := ReplicationPgHBARule("postgres", "172.23.0.1", "scram-sha-256")
+	want := "host    replication     postgres        172.23.0.1/32        scram-sha-256"
+
+	if rule != want {
+		t.Fatalf("ReplicationPgHBARule() = %q, want %q", rule, want)
+	}
+}
+
+func TestReplicationPgHBARule_LeavesCIDRAddressAlone(t *testing.T) {
+	rule := ReplicationPgHBARule("backup", "172.23.0.0/16", "md5")
+	want := "host    replication     backup          172.23.0.0/16        md5"
+
+	if rule != want {
+		t.Fatalf("ReplicationPgHBARule() = %q, want %q", rule, want)
+	}
+}
+
+func TestReplicationPgHBARule_UnknownAddress(t *testing.T) {
+	rule := ReplicationPgHBARule("postgres", "", "")
+	want := "host    replication     postgres        <client-ip>/32        scram-sha-256"
+
+	if rule != want {
+		t.Fatalf("ReplicationPgHBARule() = %q, want %q", rule, want)
+	}
+}
+
+func TestEnsureReplicationPgHBA_AppendsRuleAndCreatesBackup(t *testing.T) {
+	tmpDir := t.TempDir()
+	hbaPath := filepath.Join(tmpDir, "pg_hba.conf")
+	original := "# TYPE  DATABASE        USER            ADDRESS                 METHOD\nlocal   all             all                                     trust\n"
+	if err := os.WriteFile(hbaPath, []byte(original), 0644); err != nil {
+		t.Fatalf("write pg_hba.conf: %v", err)
+	}
+
+	rule := ReplicationPgHBARule("postgres", "172.23.0.1", "scram-sha-256")
+	result, err := EnsureReplicationPgHBA(hbaPath, rule, time.Date(2026, 7, 6, 20, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("EnsureReplicationPgHBA() error = %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("EnsureReplicationPgHBA() Changed = false, want true")
+	}
+	if result.BackupPath == "" {
+		t.Fatal("EnsureReplicationPgHBA() BackupPath is empty")
+	}
+
+	updated, err := os.ReadFile(hbaPath)
+	if err != nil {
+		t.Fatalf("read updated pg_hba.conf: %v", err)
+	}
+	if !strings.Contains(string(updated), rule) {
+		t.Fatalf("updated pg_hba.conf = %q, want it to contain %q", string(updated), rule)
+	}
+
+	backup, err := os.ReadFile(result.BackupPath)
+	if err != nil {
+		t.Fatalf("read backup pg_hba.conf: %v", err)
+	}
+	if string(backup) != original {
+		t.Fatalf("backup = %q, want original %q", string(backup), original)
+	}
+}
+
+func TestEnsureReplicationPgHBA_AcceptsDataDirectory(t *testing.T) {
+	tmpDir := t.TempDir()
+	hbaPath := filepath.Join(tmpDir, "pg_hba.conf")
+	original := "# existing config\n"
+	if err := os.WriteFile(hbaPath, []byte(original), 0644); err != nil {
+		t.Fatalf("write pg_hba.conf: %v", err)
+	}
+
+	rule := ReplicationPgHBARule("postgres", "172.23.0.1", "scram-sha-256")
+	result, err := EnsureReplicationPgHBA(tmpDir, rule, time.Date(2026, 7, 6, 20, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("EnsureReplicationPgHBA() error = %v", err)
+	}
+	if !result.Changed {
+		t.Fatal("EnsureReplicationPgHBA() Changed = false, want true")
+	}
+	if !strings.Contains(result.BackupPath, "pg_hba.conf.dbtool-backup-") {
+		t.Fatalf("BackupPath = %q, want pg_hba.conf backup path", result.BackupPath)
+	}
+
+	updated, err := os.ReadFile(hbaPath)
+	if err != nil {
+		t.Fatalf("read updated pg_hba.conf: %v", err)
+	}
+	if !strings.Contains(string(updated), rule) {
+		t.Fatalf("updated pg_hba.conf = %q, want it to contain %q", string(updated), rule)
+	}
+}
+
+func TestEnsureReplicationPgHBA_IsIdempotent(t *testing.T) {
+	tmpDir := t.TempDir()
+	hbaPath := filepath.Join(tmpDir, "pg_hba.conf")
+	rule := ReplicationPgHBARule("postgres", "172.23.0.1", "scram-sha-256")
+	content := "# existing config\n" + rule + "\n"
+	if err := os.WriteFile(hbaPath, []byte(content), 0644); err != nil {
+		t.Fatalf("write pg_hba.conf: %v", err)
+	}
+
+	result, err := EnsureReplicationPgHBA(hbaPath, rule, time.Date(2026, 7, 6, 20, 30, 0, 0, time.UTC))
+	if err != nil {
+		t.Fatalf("EnsureReplicationPgHBA() error = %v", err)
+	}
+	if result.Changed {
+		t.Fatal("EnsureReplicationPgHBA() Changed = true, want false")
+	}
+	if result.BackupPath != "" {
+		t.Fatalf("EnsureReplicationPgHBA() BackupPath = %q, want empty", result.BackupPath)
+	}
+
+	updated, err := os.ReadFile(hbaPath)
+	if err != nil {
+		t.Fatalf("read pg_hba.conf: %v", err)
+	}
+	if string(updated) != content {
+		t.Fatalf("pg_hba.conf changed unexpectedly: %q", string(updated))
 	}
 }

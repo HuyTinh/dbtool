@@ -11,6 +11,7 @@
   - `pg_dump` — dùng cho lệnh `dump`
   - `pg_restore` — dùng cho lệnh `restore` (với định dạng custom/directory)
   - `psql` — dùng cho lệnh `restore` (với định dạng plain SQL)
+  - `pg_basebackup` — dùng cho lệnh `pitr backup`
 
 ---
 
@@ -450,8 +451,10 @@ Khôi phục CSDL đến bất kỳ thời điểm nào trong quá khứ, dựa 
 
 Tự động cấu hình WAL archiving cho một profile PostgreSQL. Lệnh sẽ:
 - Kiểm tra cấu hình PostgreSQL hiện tại (`wal_level`, `archive_mode`, `archive_command`)
+- Kiểm tra user có quyền `REPLICATION` và in rule `pg_hba.conf` cho `pg_basebackup`
 - Tạo thư mục lưu WAL archive và base backup
 - Áp dụng cấu hình qua `ALTER SYSTEM SET` (không cần sửa thủ công `postgresql.conf`)
+- Có thể tự append rule vào `pg_hba.conf` bằng `--auto-setup-pg-hba` (mặc định chỉ in gợi ý)
 - Yêu cầu restart PostgreSQL nếu thay đổi `wal_level` hoặc `archive_mode`
 
 ```bash
@@ -465,6 +468,10 @@ dbtool pitr setup --profile <tên-profile> [flags]
 | `--base-backup-dir` | Thư mục lưu base backup | `~/.config/dbtool/pitr/<profile>/base` |
 | `--retention-backups` | Số base backup giữ lại | `3` |
 | `--retention-days` | Số ngày giữ WAL files | `7` |
+| `--auto-setup-pg-hba` | Tự append rule replication vào `pg_hba.conf` nếu thiếu và tạo file backup trước khi sửa | `false` |
+| `--pg-hba-file` | Đường dẫn `pg_hba.conf` hoặc thư mục data dir trên host, override `SHOW hba_file` (hữu ích khi PostgreSQL chạy Docker) | *(SHOW hba_file)* |
+| `--pg-hba-address` | Client CIDR/address cho rule replication (bỏ trống để tự detect từ connection hiện tại) | *(detect)* |
+| `--pg-hba-auth` | Auth method cho rule replication | `scram-sha-256` |
 | `--dry-run` | Hiển thị thay đổi sẽ áp dụng mà không thực thi | `false` |
 
 **Ví dụ:**
@@ -476,6 +483,18 @@ dbtool pitr setup --profile local-dev
 # Xem trước thay đổi sẽ áp dụng
 dbtool pitr setup --profile local-dev --dry-run
 
+# Tự thêm rule pg_hba.conf cho pg_basebackup replication access
+dbtool pitr setup --profile local-dev --auto-setup-pg-hba
+
+# Nếu pg_basebackup báo IP khác với IP detect được, chỉ định rõ CIDR cần thêm
+dbtool pitr setup --profile local-dev --auto-setup-pg-hba --pg-hba-address 172.23.0.1/32
+
+# Nếu PostgreSQL chạy trong Docker và SHOW hba_file trả path trong container,
+# chỉ định path pg_hba.conf được mount trên host
+dbtool pitr setup --profile local-dev --auto-setup-pg-hba \
+  --pg-hba-file ./docker/pgdata_source \
+  --pg-hba-address 172.23.0.1/32
+
 # Tùy chỉnh thư mục và retention
 dbtool pitr setup --profile local-dev \
   --archive-dir /data/wal-archive \
@@ -483,6 +502,20 @@ dbtool pitr setup --profile local-dev \
   --retention-backups 5 \
   --retention-days 14
 ```
+
+`pitr setup` sẽ in rule `pg_hba.conf` gợi ý, ví dụ:
+
+```conf
+host    replication     postgres        172.23.0.1/32        scram-sha-256
+```
+
+Mặc định, hãy kiểm tra/thêm rule này vào `pg_hba.conf` của PostgreSQL source nếu chưa có, rồi reload PostgreSQL:
+
+```sql
+SELECT pg_reload_conf();
+```
+
+Nếu muốn `dbtool` tự sửa, chạy `pitr setup --auto-setup-pg-hba`. Lệnh sẽ dùng `SHOW hba_file`, tạo backup dạng `pg_hba.conf.dbtool-backup-YYYYMMDD-HHMMSS`, append rule nếu chưa có, rồi gọi `SELECT pg_reload_conf();`. Nếu `SHOW hba_file` trả path trong container như `/var/lib/postgresql/data/pg_hba.conf` nhưng bạn chạy `dbtool` trên host Windows, truyền `--pg-hba-file <host-path>` tới file được bind mount; có thể truyền thẳng thư mục data dir, `dbtool` sẽ tự dùng file `pg_hba.conf` bên trong. `dbtool` không tự sửa `pg_hba.conf` mặc định vì file này phụ thuộc môi trường chạy PostgreSQL (Docker/WSL/native/remote) và sửa sai có thể khóa kết nối.
 
 #### 10.2. Tạo base backup (`pitr backup`)
 
@@ -509,6 +542,36 @@ dbtool pitr backup --profile local-dev
 # Backup với 4 luồng, không nén
 dbtool pitr backup --profile local-dev --jobs 4 --no-compress
 ```
+
+##### pg_hba.conf cho `pg_basebackup`
+
+`pitr backup` dùng `pg_basebackup`, nên PostgreSQL sẽ mở một **replication connection**. Kết nối SQL thông thường có thể thành công nhưng base backup vẫn fail nếu `pg_hba.conf` chưa cho phép database đặc biệt `replication`.
+
+Nếu gặp lỗi dạng:
+
+```text
+FATAL: no pg_hba.conf entry for replication connection from host "172.23.0.1", user "postgres", no encryption
+```
+
+Hãy thêm rule trên PostgreSQL source, dùng đúng user và IP hiện trong lỗi:
+
+```conf
+host    replication     postgres        172.23.0.1/32        scram-sha-256
+```
+
+Với môi trường local/dev chỉ khi chấp nhận không dùng password, có thể dùng `trust`:
+
+```conf
+host    replication     postgres        172.23.0.1/32        trust
+```
+
+Sau đó reload PostgreSQL:
+
+```sql
+SELECT pg_reload_conf();
+```
+
+Nếu PostgreSQL chạy trong Docker/WSL, IP `172.x.x.x` thường là gateway/container network. Có thể dùng đúng IP trong lỗi hoặc subnet Docker ổn định nếu phù hợp với môi trường của bạn.
 
 #### 10.3. Khôi phục theo thời điểm (`pitr restore`)
 

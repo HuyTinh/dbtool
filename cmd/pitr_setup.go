@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
 	"dbtool/internal/config"
@@ -22,6 +23,10 @@ var (
 	pitrSetupRetentionBackup int
 	pitrSetupRetentionDays   int
 	pitrSetupDryRun          bool
+	pitrSetupAutoPGHBA       bool
+	pitrSetupPGHBAFile       string
+	pitrSetupPGHBAAddress    string
+	pitrSetupPGHBAAuth       string
 )
 
 var pitrSetupCmd = &cobra.Command{
@@ -47,6 +52,10 @@ func init() {
 	pitrSetupCmd.Flags().IntVar(&pitrSetupRetentionBackup, "retention-backups", 3, "Number of base backups to keep")
 	pitrSetupCmd.Flags().IntVar(&pitrSetupRetentionDays, "retention-days", 7, "Number of days to keep WAL files")
 	pitrSetupCmd.Flags().BoolVar(&pitrSetupDryRun, "dry-run", false, "Show what would be configured without making changes")
+	pitrSetupCmd.Flags().BoolVar(&pitrSetupAutoPGHBA, "auto-setup-pg-hba", false, "Automatically append the pg_basebackup replication rule to pg_hba.conf")
+	pitrSetupCmd.Flags().StringVar(&pitrSetupPGHBAFile, "pg-hba-file", "", "Path to pg_hba.conf to edit (overrides PostgreSQL hba_file; useful when PostgreSQL runs in Docker)")
+	pitrSetupCmd.Flags().StringVar(&pitrSetupPGHBAAddress, "pg-hba-address", "", "Client CIDR/address for the pg_hba.conf replication rule (default: detected client address)")
+	pitrSetupCmd.Flags().StringVar(&pitrSetupPGHBAAuth, "pg-hba-auth", "scram-sha-256", "Authentication method for the pg_hba.conf replication rule")
 
 	_ = pitrSetupCmd.MarkFlagRequired("profile")
 
@@ -81,8 +90,36 @@ func runPITRSetup(ctx context.Context) error {
 	}
 	defer conn.Close(ctx)
 
+	// Check replication privilege for pg_basebackup
+	fmt.Println("  Checking replication role...")
+
+	if err := CheckReplicationPrerequisites(ctx, conn); err != nil {
+		return err
+	}
+
+	fmt.Println("  ✓ replication role is enabled")
+
+	var clientAddr string
+	if err := conn.QueryRow(ctx, "SELECT COALESCE(inet_client_addr()::text, '')").Scan(&clientAddr); err != nil {
+		clientAddr = ""
+	}
+	pgHBAAddress := clientAddr
+	if pitrSetupPGHBAAddress != "" {
+		pgHBAAddress = pitrSetupPGHBAAddress
+	}
+	pgHBARule := pitr.ReplicationPgHBARule(profile.User, pgHBAAddress, pitrSetupPGHBAAuth)
+
+	fmt.Println("  ℹ pg_basebackup also requires a pg_hba.conf entry for database \"replication\"")
+	if pitrSetupAutoPGHBA {
+		fmt.Println("    Auto setup enabled; dbtool will append the replication rule to pg_hba.conf if needed.")
+	} else {
+		fmt.Println("    Suggested pg_hba.conf rule (adjust the address if pg_basebackup reports a different client IP):")
+	}
+	fmt.Printf("      %s\n", pgHBARule)
+
 	// Query PostgreSQL settings
-	query := `SELECT name, setting FROM pg_settings WHERE name IN ('wal_level', 'archive_mode', 'archive_command', 'data_directory')`
+	query := `SELECT name, setting FROM pg_settings WHERE name IN ('wal_level', 'archive_mode', 'archive_command', 'data_directory', 'hba_file')`
+
 	rows, err := conn.Query(ctx, query)
 	if err != nil {
 		return fmt.Errorf("cannot query pg_settings: %w", err)
@@ -102,6 +139,11 @@ func runPITRSetup(ctx context.Context) error {
 	archiveMode := settings["archive_mode"]
 	archiveCommand := settings["archive_command"]
 	dataDirectory := settings["data_directory"]
+	hbaFile := settings["hba_file"]
+	effectiveHBAFile := hbaFile
+	if pitrSetupPGHBAFile != "" {
+		effectiveHBAFile = pitrSetupPGHBAFile
+	}
 
 	// Step 3: Create PITR directories
 	profilePITRDir, err := pitr.GetProfilePITRDir(pitrSetupProfile)
@@ -144,10 +186,16 @@ func runPITRSetup(ctx context.Context) error {
 
 	// Step 5: Dry run
 	if pitrSetupDryRun {
-		fmt.Println("\n\033[1;34mℹ Dry run mode — no changes will be made.\033[0m\n")
+		fmt.Print("\n\033[1;34mℹ Dry run mode — no changes will be made.\033[0m\n\n")
 		fmt.Println("Current PostgreSQL settings:")
 		fmt.Printf("  wal_level = %s\n", walLevel)
 		fmt.Printf("  archive_mode = %s\n", archiveMode)
+		if hbaFile != "" {
+			fmt.Printf("  hba_file = %s\n", hbaFile)
+		}
+		if pitrSetupPGHBAFile != "" {
+			fmt.Printf("  pg_hba.conf edit path = %s\n", pitrSetupPGHBAFile)
+		}
 		if archiveCommand == "" {
 			fmt.Printf("  archive_command = (not set)\n")
 		} else {
@@ -168,6 +216,16 @@ func runPITRSetup(ctx context.Context) error {
 		}
 
 		fmt.Printf("  ALTER SYSTEM SET archive_command = '%s'\n", generatedArchiveCommand)
+		if pitrSetupAutoPGHBA {
+			if effectiveHBAFile == "" {
+				fmt.Println("  pg_hba.conf auto setup requested, but PostgreSQL did not report hba_file")
+			} else {
+				fmt.Printf("  Append replication rule to %s if missing:\n", effectiveHBAFile)
+				fmt.Printf("    %s\n", pgHBARule)
+			}
+		} else {
+			fmt.Println("  pg_hba.conf is not edited automatically; add/review the suggested replication rule if needed")
+		}
 		fmt.Println("\n(Dry run — configuration not saved)")
 		return nil
 	}
@@ -175,6 +233,7 @@ func runPITRSetup(ctx context.Context) error {
 	// Step 6: Apply configuration via ALTER SYSTEM SET
 	needRestart := false
 	changes := 0
+	pgHBAChanged := false
 
 	fmt.Println("\nConfiguring PostgreSQL...")
 
@@ -203,34 +262,74 @@ func runPITRSetup(ctx context.Context) error {
 	} else {
 		fmt.Printf("  ✓ archive_mode = %s (already OK)\n", archiveMode)
 	}
-
 	// archive_command
-	archiveCommandChanged := archiveCommand == "" || archiveCommand == "(disabled)" || archiveCommand != generatedArchiveCommand
+	archiveCommandChanged := archiveCommand == "" ||
+		archiveCommand == "(disabled)" ||
+		archiveCommand != generatedArchiveCommand
+
 	if archiveCommandChanged {
 		fmt.Printf("  Setting archive_command...\n")
-		_, err = conn.Exec(ctx, "ALTER SYSTEM SET archive_command = $1", generatedArchiveCommand)
+
+		escapedArchiveCommand := strings.ReplaceAll(
+			generatedArchiveCommand,
+			"'",
+			"''",
+		)
+
+		query := fmt.Sprintf(
+			"ALTER SYSTEM SET archive_command = '%s'",
+			escapedArchiveCommand,
+		)
+
+		_, err = conn.Exec(ctx, query)
 		if err != nil {
 			return fmt.Errorf("cannot set archive_command: %w", err)
 		}
+
 		changes++
 	} else {
 		fmt.Printf("  ✓ archive_command (already configured)\n")
 	}
 
+	if pitrSetupAutoPGHBA {
+		if effectiveHBAFile == "" {
+			return fmt.Errorf("cannot auto setup pg_hba.conf: PostgreSQL did not report hba_file; pass --pg-hba-file <path> to edit a known host path")
+		}
+
+		fmt.Printf("  Ensuring pg_hba.conf replication rule...\n")
+		result, err := pitr.EnsureReplicationPgHBA(effectiveHBAFile, pgHBARule, time.Now())
+		if err != nil {
+			return fmt.Errorf("cannot auto setup pg_hba.conf: %w\nSuggestion: if PostgreSQL runs in Docker, pass --pg-hba-file with the host-mounted pg_hba.conf path instead of the container path reported by SHOW hba_file (%s)", err, hbaFile)
+		}
+		if result.Changed {
+			pgHBAChanged = true
+			fmt.Printf("  ✓ pg_hba.conf updated: %s\n", effectiveHBAFile)
+			fmt.Printf("  ✓ backup created: %s\n", result.BackupPath)
+		} else {
+			fmt.Printf("  ✓ pg_hba.conf already contains the replication rule\n")
+		}
+	}
+
 	// Reload config (archive_command takes effect on reload)
-	if !needRestart {
+	if !needRestart || pgHBAChanged {
 		_, err = conn.Exec(ctx, "SELECT pg_reload_conf()")
 		if err != nil {
 			fmt.Printf("  ⚠ Warning: could not reload PostgreSQL config: %v\n", err)
 		} else {
-			fmt.Println("  ✓ PostgreSQL configuration reloaded")
+			if needRestart {
+				fmt.Println("  ✓ PostgreSQL configuration reloaded for pg_hba.conf (restart still required for WAL settings)")
+			} else {
+				fmt.Println("  ✓ PostgreSQL configuration reloaded")
+			}
 		}
 	}
 
 	// Step 7: Report results
 	fmt.Println()
-	if changes == 0 {
+	if changes == 0 && !pgHBAChanged {
 		fmt.Println("✓ PITR is already configured for profile", pitrSetupProfile)
+	} else if changes == 0 {
+		fmt.Println("✓ pg_hba.conf updated for profile", pitrSetupProfile)
 	} else {
 		fmt.Printf("✓ Applied %d configuration change(s) via ALTER SYSTEM SET\n", changes)
 	}
@@ -259,6 +358,17 @@ func runPITRSetup(ctx context.Context) error {
 		fmt.Printf("  dbtool pitr backup --profile %s\n", pitrSetupProfile)
 	}
 
+	if hbaFile != "" {
+		fmt.Println()
+		fmt.Println("pg_hba.conf note:")
+		fmt.Printf("  PostgreSQL hba_file: %s\n", hbaFile)
+		if pitrSetupPGHBAFile != "" {
+			fmt.Printf("  Edited file: %s\n", pitrSetupPGHBAFile)
+		}
+		fmt.Println("  Ensure it contains the replication rule printed above, then reload PostgreSQL if you edit it:")
+		fmt.Println("    SELECT pg_reload_conf();")
+	}
+
 	// Step 8: Save PITR config
 	pitrConfig := &pitr.PITRConfig{
 		ProfileName:   pitrSetupProfile,
@@ -277,5 +387,28 @@ func runPITRSetup(ctx context.Context) error {
 	}
 
 	fmt.Printf("\n✓ PITR configuration saved to %s\n", filepath.Join(profilePITRDir, "config.yaml"))
+	return nil
+}
+
+func CheckReplicationPrerequisites(ctx context.Context, conn *pgx.Conn) error {
+	var hasReplication bool
+
+	err := conn.QueryRow(ctx, `
+        SELECT rolreplication
+        FROM pg_roles
+        WHERE rolname = current_user
+    `).Scan(&hasReplication)
+	if err != nil {
+		return fmt.Errorf("cannot check replication role: %w", err)
+	}
+
+	if !hasReplication {
+		return fmt.Errorf(
+			"current role does not have REPLICATION privilege.\n" +
+				"Run as superuser:\n" +
+				"  ALTER ROLE current_user WITH REPLICATION",
+		)
+	}
+
 	return nil
 }

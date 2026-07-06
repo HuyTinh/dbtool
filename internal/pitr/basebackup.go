@@ -2,9 +2,12 @@ package pitr
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -18,12 +21,12 @@ import (
 
 // BackupOptions holds options for running pg_basebackup
 type BackupOptions struct {
-	Profile      config.Profile
-	OutputDir    string
-	Jobs         int
-	Checkpoint   string // "fast" or "spread"
-	NoCompress   bool
-	Verbose      bool
+	Profile    config.Profile
+	OutputDir  string
+	Jobs       int
+	Checkpoint string // "fast" or "spread"
+	NoCompress bool
+	Verbose    bool
 }
 
 // RunBaseBackup executes pg_basebackup and returns metadata
@@ -48,24 +51,30 @@ func RunBaseBackup(ctx context.Context, opts BackupOptions) (*BaseBackupMetadata
 		args = append(args, "-z") // gzip compression
 	}
 
-	if opts.Jobs > 1 {
-		args = append(args, "-j", fmt.Sprint(opts.Jobs))
-	}
-
 	cmd := exec.CommandContext(ctx, "pg_basebackup", args...)
 	cmd.Env = append(os.Environ(), "PGPASSWORD="+opts.Profile.Password)
 
+	var stdout, stderr bytes.Buffer
 	if opts.Verbose {
-		cmd.Stdout = os.Stdout
-		cmd.Stderr = os.Stderr
+		cmd.Stdout = io.MultiWriter(os.Stdout, &stdout)
+		cmd.Stderr = io.MultiWriter(os.Stderr, &stderr)
 	} else {
-		cmd.Stdout = nil
-		cmd.Stderr = nil
+		cmd.Stdout = &stdout
+		cmd.Stderr = &stderr
 	}
 
 	startTime := time.Now()
 	if err := cmd.Run(); err != nil {
-		return nil, fmt.Errorf("pg_basebackup failed: %w", err)
+		stderrText := strings.TrimSpace(stderr.String())
+		if stderrText == "" {
+			return nil, fmt.Errorf("pg_basebackup failed: %w", err)
+		}
+
+		if suggestion := BaseBackupSuggestion(stderrText); suggestion != "" {
+			return nil, fmt.Errorf("pg_basebackup failed: %w: %s\n\nSuggestion:\n%s", err, stderrText, suggestion)
+		}
+
+		return nil, fmt.Errorf("pg_basebackup failed: %w: %s", err, stderrText)
 	}
 	duration := int(time.Since(startTime).Seconds())
 
@@ -100,6 +109,65 @@ func RunBaseBackup(ctx context.Context, opts BackupOptions) (*BaseBackupMetadata
 	}
 
 	return metadata, nil
+}
+
+// BaseBackupSuggestion returns an actionable suggestion for known pg_basebackup failures.
+func BaseBackupSuggestion(stderr string) string {
+	lower := strings.ToLower(stderr)
+
+	if strings.Contains(lower, "no pg_hba.conf entry for replication connection") {
+		user := extractQuotedValue(stderr, `user "([^"]+)"`)
+		clientHost := extractQuotedValue(stderr, `from host "([^"]+)"`)
+
+		return fmt.Sprintf(
+			"PostgreSQL allows normal DB connections but blocks replication connections.\n"+
+				"Add a pg_hba.conf row on the source PostgreSQL server, for example:\n"+
+				"  %s\n"+
+				"Then reload PostgreSQL:\n"+
+				"  SELECT pg_reload_conf();\n"+
+				"If PostgreSQL runs in Docker, edit the mounted pg_hba.conf or container config and restart/reload the container.",
+			ReplicationPgHBARule(user, clientHost, "scram-sha-256"),
+		)
+	}
+
+	if strings.Contains(lower, "must be superuser or replication role") ||
+		strings.Contains(lower, "replication privilege") {
+		return "The configured PostgreSQL user needs REPLICATION privilege or superuser permissions.\n" +
+			"Run as a superuser, replacing <user> with the profile user:\n" +
+			"  ALTER ROLE <user> WITH REPLICATION;"
+	}
+
+	return ""
+}
+
+// ReplicationPgHBARule formats the pg_hba.conf rule pg_basebackup needs.
+func ReplicationPgHBARule(user, address, authMethod string) string {
+	if user == "" {
+		user = "<user>"
+	}
+	if authMethod == "" {
+		authMethod = "scram-sha-256"
+	}
+	if address == "" {
+		address = "<client-ip>/32"
+	} else if !strings.Contains(address, "/") {
+		if ip := net.ParseIP(address); ip != nil && ip.To4() == nil {
+			address += "/128"
+		} else {
+			address += "/32"
+		}
+	}
+
+	return fmt.Sprintf("host    replication     %-15s %s        %s", user, address, authMethod)
+}
+
+func extractQuotedValue(text, pattern string) string {
+	re := regexp.MustCompile(pattern)
+	matches := re.FindStringSubmatch(text)
+	if len(matches) != 2 {
+		return ""
+	}
+	return matches[1]
 }
 
 // parseBackupLabel parses the backup_label file from the backup
