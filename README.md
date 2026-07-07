@@ -163,6 +163,8 @@ dbtool tui
 | Chọn profile đích (migrate) | `[enter]` chọn | Chọn profile đích để migrate schema+dữ liệu. |
 | Đang restore/migrate | — | Thanh tiến trình và log realtime. |
 
+**Lưu ý an toàn trong TUI:** các thao tác restore/dump/migrate chỉ chạy sau màn hình xác nhận. Khi bật `clean`, TUI sẽ cảnh báo vì thao tác này có thể drop object trước khi restore/migrate. Xóa profile trong TUI chỉ xóa cấu hình profile local của dbtool, không xóa database thật.
+
 **Ví dụ luồng sử dụng:**
 
 ```

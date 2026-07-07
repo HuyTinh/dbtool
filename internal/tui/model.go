@@ -55,10 +55,10 @@ type fileEntry struct {
 
 // --- Result returned when TUI completes ---
 type Result struct {
-	Profile      config.Profile
-	File         string
-	Settings     RestoreSettings
-	Confirm      bool
+	Profile  config.Profile
+	File     string
+	Settings RestoreSettings
+	Confirm  bool
 	// Dump-specific
 	Mode         Mode
 	DumpFile     string
@@ -106,7 +106,7 @@ type Model struct {
 	dryRunOutput string
 
 	// Dump state
-	dumpOutputInput textinput.Model
+	dumpOutputInput  textinput.Model
 	dumpProgressChan <-chan driver.Progress
 	dumpProgressPct  float64
 	dumpProgressText string
@@ -164,7 +164,7 @@ func NewModel(cfg *config.Config, initSettings RestoreSettings) Model {
 		profiles:        profiles,
 		currentDir:      cwd,
 		width:           80,
-		height:           24,
+		height:          24,
 		cfg:             cfg,
 		dumpOutputInput: dumpInput,
 		searchInput:     searchInput,
@@ -179,52 +179,6 @@ func NewModel(cfg *config.Config, initSettings RestoreSettings) Model {
 
 func (m Model) Init() tea.Cmd {
 	return nil
-}
-
-type progressMsg driver.Progress
-type restoreFinishedMsg struct {
-	err error
-}
-
-func listenToProgress(ch <-chan driver.Progress) tea.Cmd {
-	return func() tea.Msg {
-		p, ok := <-ch
-		if !ok {
-			return restoreFinishedMsg{}
-		}
-		return progressMsg(p)
-	}
-}
-
-type dumpProgressMsg driver.Progress
-type dumpFinishedMsg struct {
-	err error
-}
-
-func listenToDumpProgress(ch <-chan driver.Progress) tea.Cmd {
-	return func() tea.Msg {
-		p, ok := <-ch
-		if !ok {
-			return dumpFinishedMsg{}
-		}
-		return dumpProgressMsg(p)
-	}
-}
-
-type migrateProgressMsg driver.Progress
-type migratePhaseFinishedMsg struct {
-	err   error
-	phase int // 0=dump, 1=restore
-}
-
-func listenToMigrateProgress(ch <-chan driver.Progress, phase int) tea.Cmd {
-	return func() tea.Msg {
-		p, ok := <-ch
-		if !ok {
-			return migratePhaseFinishedMsg{phase: phase}
-		}
-		return migrateProgressMsg(p)
-	}
 }
 
 // --- Update ---
@@ -424,7 +378,7 @@ func (m Model) updateFileBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		default:
 			var cmd tea.Cmd
 			m.searchInput, cmd = m.searchInput.Update(msg)
-			m.fileIdx = 0
+			m.fileIdx = clampIndex(0, len(m.visibleEntries()))
 			return m, cmd
 		}
 	} else if key == "/" {
@@ -436,6 +390,7 @@ func (m Model) updateFileBrowser(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 
 	vis := m.visibleEntries()
+	m.fileIdx = clampIndex(m.fileIdx, len(vis))
 	switch key {
 	case "up", "k":
 		if m.fileIdx > 0 {
@@ -914,26 +869,7 @@ func (m Model) viewProfileSelector() string {
 
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorAccent).Render("  Choose a profile to restore into:\n\n"))
 
-	maxNameLen := 0
-	for _, p := range m.profiles {
-		if len(p.Name) > maxNameLen {
-			maxNameLen = len(p.Name)
-		}
-	}
-	if maxNameLen < 12 {
-		maxNameLen = 12
-	}
-
-	for i, p := range m.profiles {
-		selected := i == m.profileIdx
-		badge := renderBadge(p.Driver, "#A78BFA")
-		connStr := fmt.Sprintf("%s:%d/%s", p.Host, p.Port, p.Database)
-
-		namePart := fmt.Sprintf("%-*s", maxNameLen+2, p.Name)
-		row := renderRow(selected, namePart)
-		connPart := lipgloss.NewStyle().Foreground(colorMuted).Render(" " + connStr)
-		sb.WriteString("  " + row + " " + badge + connPart + "\n")
-	}
+	sb.WriteString(renderProfileRows(m.profiles, m.profileIdx, ""))
 
 	sb.WriteString("\n")
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  [up/down] navigate   [Enter] select   [a] add   [e] edit   [d] delete   [q] quit\n"))
@@ -958,11 +894,7 @@ func (m Model) viewFileBrowser() string {
 	sb.WriteString("  Profile: " + profileInfo + " " + badge + connStr + "\n")
 
 	// Truncate path for display
-	displayDir := m.currentDir
-	maxDirLen := m.width - 12
-	if maxDirLen > 10 && len(displayDir) > maxDirLen {
-		displayDir = "..." + displayDir[len(displayDir)-maxDirLen:]
-	}
+	displayDir := truncateMiddle(m.currentDir, m.width-12)
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  Dir: ") +
 		lipgloss.NewStyle().Foreground(colorSubtext).Render(displayDir) + "\n")
 
@@ -976,7 +908,7 @@ func (m Model) viewFileBrowser() string {
 
 	if len(vis) == 0 {
 		if m.searching && m.searchInput.Value() != "" {
-			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  (no matches)\n"))
+			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  No files match %q\n", m.searchInput.Value())))
 		} else {
 			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  (empty directory)\n"))
 		}
@@ -1021,10 +953,7 @@ func (m Model) viewFileBrowser() string {
 			if maxNameW < 20 {
 				maxNameW = 20
 			}
-			displayName := e.Name
-			if len(displayName) > maxNameW {
-				displayName = displayName[:maxNameW-3] + "..."
-			}
+			displayName := truncateMiddle(e.Name, maxNameW)
 
 			namePart := fmt.Sprintf("%-*s", maxNameW, displayName)
 			row := renderRow(selected, namePart)
@@ -1122,6 +1051,10 @@ func (m Model) viewConfirm() string {
 	}
 	if len(s.ExcludeTable) > 0 {
 		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Exc Table:") + " " + strings.Join(s.ExcludeTable, ", ") + "\n")
+	}
+
+	if s.Clean {
+		sb.WriteString("\n  " + renderDanger("Clean mode may drop database objects before restore.") + "\n")
 	}
 
 	sb.WriteString("\n")
@@ -1422,7 +1355,7 @@ func (m Model) viewEditProfileForm() string {
 		formContent += "  " + label + " " + m.inputs[i].View() + "\n"
 	}
 
-	sb.WriteString(panelStyle.Width(m.width - 4).Render(formContent))
+	sb.WriteString(renderPanel(m.width, formContent))
 	sb.WriteString("\n")
 
 	if m.formErr != "" {
@@ -1448,7 +1381,9 @@ func (m Model) viewConfirmDelete() string {
 	selected := m.profiles[m.profileIdx]
 	sb.WriteString("  " + warningStyle.Render("Are you sure you want to delete this profile?") + "\n\n")
 	sb.WriteString("  " + labelStyle.Render("Profile:") + " " + valueStyle.Render(selected.Name) + "\n")
-	sb.WriteString("  " + labelStyle.Render("Database:") + " " + valueStyle.Render(fmt.Sprintf("%s @ %s:%d", selected.Database, selected.Host, selected.Port)) + "\n\n")
+	sb.WriteString("  " + labelStyle.Render("Host:") + " " + valueStyle.Render(fmt.Sprintf("%s:%d", selected.Host, selected.Port)) + "\n")
+	sb.WriteString("  " + labelStyle.Render("Database:") + " " + valueStyle.Render(selected.Database) + "\n")
+	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Render("This only removes the local dbtool profile; it does not delete the database.") + "\n\n")
 
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
 		"  [y/Enter] yes, delete   [n/esc] no, keep it\n"))
@@ -1520,27 +1455,8 @@ func (m Model) viewRestoring() string {
 	sb.WriteString("  Profile: " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(m.result.Profile.Name) + "\n")
 	sb.WriteString("  File:    " + lipgloss.NewStyle().Foreground(colorSubtext).Render(m.result.File) + "\n\n")
 
-	width := m.width - 10
-	if width < 20 {
-		width = 20
-	}
-	if width > 60 {
-		width = 60
-	}
-
-	filledW := int(float64(width) * (m.progressPct / 100.0))
-	if filledW < 0 {
-		filledW = 0
-	}
-	if filledW > width {
-		filledW = width
-	}
-	emptyW := width - filledW
-
-	filledStr := lipgloss.NewStyle().Foreground(colorSuccess).Render(strings.Repeat("█", filledW))
-	emptyStr := lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("░", emptyW))
-
-	sb.WriteString(fmt.Sprintf("  [%s%s] %.0f%%\n\n", filledStr, emptyStr, m.progressPct))
+	barWidth := progressWidth(m.width)
+	sb.WriteString(fmt.Sprintf("  [%s] %.0f%%\n\n", renderProgressBar(barWidth, m.progressPct), clampPercent(m.progressPct)))
 	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSubtext).Render(m.progressText) + "\n")
 
 	return sb.String()
@@ -1560,11 +1476,11 @@ func (m Model) viewRestoreResult() string {
 	if m.result.Settings.DryRun {
 		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Dry Run Completed Successfully") + "\n\n")
 		sb.WriteString("  Command that would run:\n")
-		sb.WriteString(panelStyle.Width(m.width - 4).Render(m.dryRunOutput) + "\n\n")
+		sb.WriteString(renderPanel(m.width, m.dryRunOutput) + "\n\n")
 	} else if m.restoreErr != nil {
 		sb.WriteString("  " + lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")).Bold(true).Render("❌ Restoration Failed") + "\n\n")
 		sb.WriteString("  Error details:\n")
-		sb.WriteString(panelStyle.Width(m.width - 4).Render(m.restoreErr.Error()) + "\n\n")
+		sb.WriteString(renderPanel(m.width, m.restoreErr.Error()) + "\n\n")
 	} else {
 		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("✓ Database Restored Successfully!") + "\n\n")
 		sb.WriteString("  Profile: " + valueStyle.Render(m.result.Profile.Name) + "\n")
@@ -1576,7 +1492,6 @@ func (m Model) viewRestoreResult() string {
 		"  Press any key to do another operation • Q / Esc to quit\n"))
 	return sb.String()
 }
-
 
 func (m Model) updateSelectMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	switch msg.String() {
@@ -1800,7 +1715,7 @@ func (m Model) viewDumpConfirm() string {
 		format = "custom"
 	}
 
-	sb.WriteString(panelStyle.Width(m.width-4).Render(
+	sb.WriteString(renderPanel(m.width,
 		labelStyle.Render("Profile")+" "+valueStyle.Render(m.result.Profile.Name)+"\n"+
 			labelStyle.Render("Host   ")+" "+valueStyle.Render(fmt.Sprintf("%s:%d", m.result.Profile.Host, m.result.Profile.Port))+"\n"+
 			labelStyle.Render("DB     ")+" "+valueStyle.Render(m.result.Profile.Database)+"\n"+
@@ -1844,27 +1759,8 @@ func (m Model) viewDumping() string {
 	sb.WriteString("  Profile: " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(m.result.Profile.Name) + "\n")
 	sb.WriteString("  Output:  " + lipgloss.NewStyle().Foreground(colorSubtext).Render(m.result.DumpFile) + "\n\n")
 
-	width := m.width - 10
-	if width < 20 {
-		width = 20
-	}
-	if width > 60 {
-		width = 60
-	}
-
-	filledW := int(float64(width) * (m.dumpProgressPct / 100.0))
-	if filledW < 0 {
-		filledW = 0
-	}
-	if filledW > width {
-		filledW = width
-	}
-	emptyW := width - filledW
-
-	filledStr := lipgloss.NewStyle().Foreground(colorSuccess).Render(strings.Repeat("█", filledW))
-	emptyStr := lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("░", emptyW))
-
-	sb.WriteString(fmt.Sprintf("  [%s%s] %.0f%%\n\n", filledStr, emptyStr, m.dumpProgressPct))
+	barWidth := progressWidth(m.width)
+	sb.WriteString(fmt.Sprintf("  [%s] %.0f%%\n\n", renderProgressBar(barWidth, m.dumpProgressPct), clampPercent(m.dumpProgressPct)))
 	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSubtext).Render(m.dumpProgressText) + "\n")
 
 	return sb.String()
@@ -1915,7 +1811,7 @@ func (m Model) viewDumpResult() string {
 	if m.dumpErr != nil {
 		sb.WriteString("  " + lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")).Bold(true).Render("❌ Dump Failed") + "\n\n")
 		sb.WriteString("  Error details:\n")
-		sb.WriteString(panelStyle.Width(m.width-4).Render(m.dumpErr.Error()) + "\n\n")
+		sb.WriteString(renderPanel(m.width, m.dumpErr.Error()) + "\n\n")
 	} else {
 		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("✓ Database Dumped Successfully!") + "\n\n")
 		sb.WriteString("  Profile: " + valueStyle.Render(m.result.Profile.Name) + "\n")
@@ -1981,30 +1877,7 @@ func (m Model) viewMigrateDestSelector() string {
 
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorAccent).Render("  Choose the destination profile:\n\n"))
 
-	maxNameLen := 0
-	for _, p := range m.profiles {
-		if len(p.Name) > maxNameLen {
-			maxNameLen = len(p.Name)
-		}
-	}
-	if maxNameLen < 12 {
-		maxNameLen = 12
-	}
-
-	for i, p := range m.profiles {
-		selected := i == m.migrateDestIdx
-		isSource := p.Name == src.Name
-		badge := renderBadge(p.Driver, "#A78BFA")
-		connStr := fmt.Sprintf("%s:%d/%s", p.Host, p.Port, p.Database)
-
-		namePart := fmt.Sprintf("%-*s", maxNameLen+2, p.Name)
-		if isSource {
-			namePart += lipgloss.NewStyle().Foreground(colorMuted).Render(" (source)")
-		}
-		row := renderRow(selected, namePart)
-		connPart := lipgloss.NewStyle().Foreground(colorMuted).Render(" " + connStr)
-		sb.WriteString("  " + row + " " + badge + connPart + "\n")
-	}
+	sb.WriteString(renderProfileRows(m.profiles, m.migrateDestIdx, src.Name))
 
 	sb.WriteString("\n")
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
@@ -2190,6 +2063,11 @@ func (m Model) viewMigrateConfirm() string {
 		sb.WriteString("  " + label + " " + val + "\n")
 	}
 
+	sb.WriteString("\n  " + renderDanger("Migration target may be overwritten during restore phase.") + "\n")
+	if s.Clean {
+		sb.WriteString("  " + renderDanger("Clean mode may drop target database objects before migrate restore.") + "\n")
+	}
+
 	sb.WriteString("\n")
 	sb.WriteString(lipgloss.NewStyle().Foreground(colorWarning).Bold(true).Render(
 		"  ! Press Enter to migrate (target may be overwritten).\n"))
@@ -2215,32 +2093,13 @@ func (m Model) viewMigrating() string {
 	sb.WriteString("  Source: " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(m.result.Profile.Name) + "\n")
 	sb.WriteString("  Target: " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(m.result.DestProfile.Name) + "\n\n")
 
-	width := m.width - 10
-	if width < 20 {
-		width = 20
-	}
-	if width > 60 {
-		width = 60
-	}
-
-	filledW := int(float64(width) * (m.migrateProgressPct / 100.0))
-	if filledW < 0 {
-		filledW = 0
-	}
-	if filledW > width {
-		filledW = width
-	}
-	emptyW := width - filledW
-
-	filledStr := lipgloss.NewStyle().Foreground(colorSuccess).Render(strings.Repeat("█", filledW))
-	emptyStr := lipgloss.NewStyle().Foreground(colorMuted).Render(strings.Repeat("░", emptyW))
-
 	phaseLabel := "Phase 1/2: Dump"
 	if m.migratePhase == 1 {
 		phaseLabel = "Phase 2/2: Restore"
 	}
 
-	sb.WriteString(fmt.Sprintf("  [%s%s] %.0f%%  %s\n\n", filledStr, emptyStr, m.migrateProgressPct, phaseLabel))
+	barWidth := progressWidth(m.width)
+	sb.WriteString(fmt.Sprintf("  [%s] %.0f%%  %s\n\n", renderProgressBar(barWidth, m.migrateProgressPct), clampPercent(m.migrateProgressPct), phaseLabel))
 	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSubtext).Render(m.migrateProgressText) + "\n")
 
 	return sb.String()
@@ -2382,7 +2241,7 @@ func (m Model) viewMigrateResult() string {
 	if m.migrateErr != nil {
 		sb.WriteString("  " + lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")).Bold(true).Render("❌ Migration Failed") + "\n\n")
 		sb.WriteString("  Error details:\n")
-		sb.WriteString(panelStyle.Width(m.width-4).Render(m.migrateErr.Error()) + "\n\n")
+		sb.WriteString(renderPanel(m.width, m.migrateErr.Error()) + "\n\n")
 	} else {
 		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("✓ Migration Completed Successfully!") + "\n\n")
 		sb.WriteString("  Source: " + valueStyle.Render(m.result.Profile.Name) + " (" + m.result.Profile.Database + ")\n")
