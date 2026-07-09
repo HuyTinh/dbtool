@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	stdruntime "runtime"
 	"strings"
 	"time"
 
@@ -179,12 +178,13 @@ func runPITRSetup(ctx context.Context) error {
 	fmt.Printf("✓ Archive directory: %s\n", archiveDir)
 	fmt.Printf("✓ Base backup directory: %s\n", baseBackupDir)
 
-	// Step 4: Generate archive_command
-	var generatedArchiveCommand string
-	if stdruntime.GOOS == "windows" {
-		generatedArchiveCommand = fmt.Sprintf(`copy "%%p" "%s\%%f"`, archiveDir)
-	} else {
-		generatedArchiveCommand = fmt.Sprintf("cp %%p %s/%%f", archiveDir)
+	// Step 4: Generate archive_command for the PostgreSQL runtime, not the dbtool host OS
+	generatedArchiveCommand, archiveDirForPostgres, err := pitr.BuildArchiveCommand(profile, archiveDir)
+	if err != nil {
+		return fmt.Errorf("cannot generate archive_command: %w", err)
+	}
+	if archiveDirForPostgres != filepath.Clean(archiveDir) {
+		fmt.Printf("✓ PostgreSQL archive path: %s\n", archiveDirForPostgres)
 	}
 
 	// Step 5: Dry run

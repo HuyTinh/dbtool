@@ -72,3 +72,50 @@ func TestMapContainerPathToHostUsesLongestTargetPrefix(t *testing.T) {
 		t.Fatalf("host path mismatch: got %s want %s", result.HostPath, want)
 	}
 }
+
+func TestMapHostPathToContainerBindMount(t *testing.T) {
+	mounts := []config.MountMapping{{
+		Type:   "bind",
+		Source: filepath.Join("repo", "pgdata"),
+		Target: "/var/lib/postgresql/data",
+	}}
+
+	result := MapHostPathToContainer(filepath.Join("repo", "pgdata", "archive"), mounts)
+
+	if !result.Matched || !result.Editable {
+		t.Fatalf("expected editable match, got %#v", result)
+	}
+	if result.HostPath != "/var/lib/postgresql/data/archive" {
+		t.Fatalf("container path mismatch: got %s", result.HostPath)
+	}
+}
+
+func TestMapHostPathToContainerUsesLongestSourcePrefix(t *testing.T) {
+	mounts := []config.MountMapping{
+		{Type: "bind", Source: filepath.Join("repo", "data"), Target: "/var/lib/postgresql/data"},
+		{Type: "bind", Source: filepath.Join("repo", "data", "archive"), Target: "/mnt/archive"},
+	}
+
+	result := MapHostPathToContainer(filepath.Join("repo", "data", "archive", "wal"), mounts)
+
+	if !result.Matched || !result.Editable {
+		t.Fatalf("expected editable match, got %#v", result)
+	}
+	if result.HostPath != "/mnt/archive/wal" {
+		t.Fatalf("container path mismatch: got %s", result.HostPath)
+	}
+}
+
+func TestMapHostPathToContainerNoMatch(t *testing.T) {
+	mounts := []config.MountMapping{{
+		Type:   "bind",
+		Source: filepath.Join("repo", "pgdata"),
+		Target: "/var/lib/postgresql/data",
+	}}
+
+	result := MapHostPathToContainer(filepath.Join("other", "archive"), mounts)
+
+	if result.Matched {
+		t.Fatalf("expected no match, got %#v", result)
+	}
+}

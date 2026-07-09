@@ -79,11 +79,18 @@ type Model struct {
 	profileIdx int
 
 	// Form inputs (for Add/Edit)
-	inputs     []textinput.Model
-	focusedIdx int
-	isEditing  bool
-	origName   string
-	formErr    string
+	inputs             []textinput.Model
+	focusedIdx         int
+	isEditing          bool
+	origName           string
+	formErr            string
+	formInfo           string
+	formNotice         string
+	formRuntime        *config.RuntimeProfile
+	formRuntimeDetails bool
+	runtimeDetecting   bool
+	runtimeDetectPct   float64
+	runtimeDetectText  string
 
 	// Configuration object reference for direct saving
 	cfg *config.Config
@@ -134,13 +141,7 @@ type Model struct {
 }
 
 func NewModel(cfg *config.Config, initSettings RestoreSettings) Model {
-	profiles := make([]config.Profile, 0, len(cfg.Profiles))
-	for _, p := range cfg.Profiles {
-		profiles = append(profiles, p)
-	}
-	sort.Slice(profiles, func(i, j int) bool {
-		return profiles[i].Name < profiles[j].Name
-	})
+	profiles := profilesFromConfig(cfg)
 
 	cwd, _ := os.Getwd()
 
@@ -226,6 +227,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case migratePhaseFinishedMsg:
 		return m.handleMigratePhaseFinished(msg)
 
+	case runtimeDetectProgressMsg:
+		m.runtimeDetecting = true
+		m.runtimeDetectPct = msg.Percent
+		m.runtimeDetectText = msg.Message
+		return m, listenToRuntimeDetect(msg.Ch)
+
+	case runtimeDetectFinishedMsg:
+		m.runtimeDetecting = false
+		m.runtimeDetectPct = 0
+		m.runtimeDetectText = ""
+		return m.finishRuntimeDetection(msg)
+
 	case tea.KeyMsg:
 		switch m.step {
 		case stepSelectMode:
@@ -296,10 +309,7 @@ func (m Model) updateProfileSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if len(m.profiles) == 0 {
 		switch msg.String() {
 		case "a", "A":
-			m.inputs = m.initFormFields(nil)
-			m.focusedIdx = 0
-			m.isEditing = false
-			m.formErr = ""
+			m.startProfileForm(nil, false)
 			m.step = stepEditProfileForm
 			return m, nil
 		case "q", "ctrl+c", "esc":
@@ -333,18 +343,11 @@ func (m Model) updateProfileSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.step = stepSelectFile
 		}
 	case "a", "A":
-		m.inputs = m.initFormFields(nil)
-		m.focusedIdx = 0
-		m.isEditing = false
-		m.formErr = ""
+		m.startProfileForm(nil, false)
 		m.step = stepEditProfileForm
 	case "e", "E":
 		selected := m.profiles[m.profileIdx]
-		m.inputs = m.initFormFields(&selected)
-		m.focusedIdx = 0
-		m.isEditing = true
-		m.origName = selected.Name
-		m.formErr = ""
+		m.startProfileForm(&selected, true)
 		m.step = stepEditProfileForm
 	case "d", "D", "delete":
 		m.step = stepConfirmDelete
@@ -850,77 +853,80 @@ func renderBadge(label, bg string) string {
 }
 
 func (m Model) viewProfileSelector() string {
-	var sb strings.Builder
+	var body strings.Builder
 
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render("dbtool — Select a Connection Profile")
-	sb.WriteString(title + "\n\n")
+	body.WriteString(renderSectionTitle(profileSelectorPrompt(m.result.Mode)))
+	body.WriteString("\n\n")
 
 	if len(m.profiles) == 0 {
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorWarning).Bold(true).Render("  No profiles found.") + "\n")
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  Press [a] to add a new profile.\n\n"))
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  Press q to quit.\n"))
-		return sb.String()
+		body.WriteString(renderCard(m.width, "No profiles found", warningStyle.Render("Press A to add a new connection profile.")))
+	} else {
+		body.WriteString(renderProfileRows(m.width, m.profiles, m.profileIdx, ""))
 	}
 
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorAccent).Render("  Choose a profile to restore into:\n\n"))
+	return renderScreenFrame(m.width, "Select Connection Profile", profileSelectorSubtitle(m.result.Mode), body.String(), []keyHint{
+		{Key: "↑/↓", Label: "navigate"},
+		{Key: "Enter", Label: "select"},
+		{Key: "A", Label: "add"},
+		{Key: "E", Label: "edit"},
+		{Key: "D", Label: "delete"},
+		{Key: "Esc", Label: "back", Danger: true},
+		{Key: "Q", Label: "quit", Danger: true},
+	})
+}
 
-	sb.WriteString(renderProfileRows(m.profiles, m.profileIdx, ""))
+func profileSelectorPrompt(mode Mode) string {
+	switch mode {
+	case ModeDump:
+		return "Choose a source profile to dump"
+	case ModeMigrate:
+		return "Choose a source profile to migrate"
+	default:
+		return "Choose a target profile to restore into"
+	}
+}
 
-	sb.WriteString("\n")
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  [up/down] navigate   [Enter] select   [a] add   [e] edit   [d] delete   [q] quit\n"))
-	return sb.String()
+func profileSelectorSubtitle(mode Mode) string {
+	switch mode {
+	case ModeDump:
+		return "Source database for backup export"
+	case ModeMigrate:
+		return "Source database for profile-to-profile copy"
+	default:
+		return "Target database for dump restore"
+	}
 }
 
 func (m Model) viewFileBrowser() string {
-	var sb strings.Builder
-
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render("dbtool — Select a Dump File")
-	sb.WriteString(title + "\n\n")
+	var body strings.Builder
 
 	p := m.result.Profile
-	badge := renderBadge(p.Driver, "#A78BFA")
-	profileInfo := lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(p.Name)
-	connStr := lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %s:%d/%s", p.Host, p.Port, p.Database))
-	sb.WriteString("  Profile: " + profileInfo + " " + badge + connStr + "\n")
+	body.WriteString(renderProfileSummaryCard(m.width, "Target Profile", p.Name, p.Driver, p.Host, p.Port, p.Database, p.User))
+	body.WriteString("\n\n")
 
-	// Truncate path for display
-	displayDir := truncateMiddle(m.currentDir, m.width-12)
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  Dir: ") +
-		lipgloss.NewStyle().Foreground(colorSubtext).Render(displayDir) + "\n")
-
+	details := renderKeyValueGrid([]kvRow{{Label: "Path", Value: truncateMiddle(m.currentDir, safePanelWidth(m.width)-14)}}, 10)
 	if m.searching {
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  Filter: ") +
-			m.searchInput.View() + "\n")
+		details += "\n" + renderKeyValueGrid([]kvRow{{Label: "Filter", Value: m.searchInput.View()}}, 10)
 	}
+	body.WriteString(renderCard(m.width, "Browse Dump Files", details))
+	body.WriteString("\n\n")
 
 	vis := m.visibleEntries()
-	sb.WriteString("\n")
-
 	if len(vis) == 0 {
+		message := "Directory is empty"
 		if m.searching && m.searchInput.Value() != "" {
-			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  No files match %q\n", m.searchInput.Value())))
-		} else {
-			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render("  (empty directory)\n"))
+			message = fmt.Sprintf("No files match %q", m.searchInput.Value())
 		}
+		body.WriteString(renderCard(m.width, "No Results", mutedStyle.Render(message)))
 	} else {
-		// Only render visible window (scrolling)
-		headerLines := 10
+		var listBody strings.Builder
+		headerLines := 14
 		if m.searching {
-			headerLines = 11
+			headerLines = 15
 		}
 		visible := m.height - headerLines
-		if visible < 5 {
-			visible = 5
+		if visible < 3 {
+			visible = 3
 		}
 		start := 0
 		if m.fileIdx >= visible {
@@ -932,138 +938,81 @@ func (m Model) viewFileBrowser() string {
 		}
 
 		for i := start; i < end; i++ {
-			e := vis[i]
-			selected := i == m.fileIdx
-
-			var badgeStr string
-			var extra string
-
-			if e.IsDir {
-				badgeStr = renderBadge("DIR", "#FBBF24")
-			} else {
-				ext := strings.ToUpper(strings.TrimPrefix(filepath.Ext(e.Name), "."))
-				if ext == "" {
-					ext = "FILE"
-				}
-				badgeStr = renderBadge(ext, "#34D399")
-				extra = lipgloss.NewStyle().Foreground(colorMuted).Render("  " + formatBytes(e.Size))
+			if i > start {
+				listBody.WriteString("\n")
 			}
-
-			maxNameW := m.width - 20
-			if maxNameW < 20 {
-				maxNameW = 20
-			}
-			displayName := truncateMiddle(e.Name, maxNameW)
-
-			namePart := fmt.Sprintf("%-*s", maxNameW, displayName)
-			row := renderRow(selected, namePart)
-			sb.WriteString("  " + row + " " + badgeStr + extra + "\n")
+			listBody.WriteString(renderFileEntryRow(m.width, vis[i], i == m.fileIdx))
 		}
+		body.WriteString(renderCard(m.width, "Directory Entries", listBody.String()))
 
-		// Scroll indicator
-		total := len(vis)
-		if total > visible {
-			sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-				fmt.Sprintf("  ... showing %d-%d of %d items\n", start+1, end, total),
-			))
+		if len(vis) > visible {
+			body.WriteString("\n\n")
+			body.WriteString(mutedStyle.Render(fmt.Sprintf("Showing %d-%d of %d items", start+1, end, len(vis))))
 		}
 	}
 
-	sb.WriteString("\n")
+	hints := []keyHint{{Key: "↑/↓", Label: "navigate"}, {Key: "/", Label: "filter"}, {Key: "Enter", Label: "open/select"}, {Key: "⌫/←", Label: "parent"}, {Key: "Esc", Label: "back", Danger: true}}
 	if m.searching {
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-			"  [up/down] navigate results   [Enter] select   [esc] clear filter\n"))
-	} else {
-		sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-			"  [up/down] navigate   [/] filter   [Enter] open/select   [Backspace/left] parent   [esc] back\n"))
+		hints = []keyHint{{Key: "↑/↓", Label: "navigate"}, {Key: "Enter", Label: "select"}, {Key: "Esc", Label: "clear filter", Danger: true}}
 	}
-	return sb.String()
+
+	return renderScreenFrame(m.width, "Select Dump File", "Choose a dump artifact for restore", body.String(), hints)
 }
 
 func (m Model) viewConfirm() string {
-	var sb strings.Builder
-
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render("dbtool — Confirm Restore")
-	sb.WriteString(title + "\n\n")
-
+	var body strings.Builder
 	p := m.result.Profile
-	rows := []struct{ label, value string }{
-		{"Profile", p.Name},
-		{"Driver", p.Driver},
-		{"Host", fmt.Sprintf("%s:%d", p.Host, p.Port)},
-		{"Database", p.Database},
-		{"User", p.User},
-		{"File", m.result.File},
-	}
-
-	for _, row := range rows {
-		label := lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render(row.label + ":")
-		val := lipgloss.NewStyle().Foreground(colorSubtext).Render(row.value)
-		sb.WriteString("  " + label + " " + val + "\n")
-	}
-
-	sb.WriteString("\n" + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("  Restore Settings:") + "\n")
-
 	s := m.result.Settings
-	cleanVal := lipgloss.NewStyle().Foreground(colorMuted).Render("No")
-	if s.Clean {
-		cleanVal = lipgloss.NewStyle().Foreground(colorWarning).Bold(true).Render("Yes (--clean: drop objects first)")
-	}
 
-	createDbVal := lipgloss.NewStyle().Foreground(colorMuted).Render("No")
+	body.WriteString(renderProfileSummaryCard(m.width, "Target Profile", p.Name, p.Driver, p.Host, p.Port, p.Database, p.User))
+	body.WriteString("\n")
+	body.WriteString(renderCard(m.width, "Dump File", renderKeyValueGrid([]kvRow{
+		{Label: "Path", Value: truncateMiddle(m.result.File, safePanelWidth(m.width)-14)},
+		{Label: "Format", Value: s.Format, Kind: badgePrimary},
+		{Label: "Jobs", Value: fmt.Sprintf("%d parallel processes", s.Jobs)},
+	}, 10)))
+	body.WriteString("\n")
+
+	cleanValue := "No"
+	cleanKind := badgeNeutral
+	if s.Clean {
+		cleanValue = "CLEAN"
+		cleanKind = badgeDanger
+	}
+	createValue := "No"
+	createKind := badgeNeutral
 	if s.CreateIfMissing {
-		createDbVal = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("Yes (create DB if missing)")
+		createValue = "CREATE"
+		createKind = badgeSuccess
 	}
-
-	optimizeVal := lipgloss.NewStyle().Foreground(colorMuted).Render("No")
+	optimizeValue := "No"
+	optimizeKind := badgeNeutral
 	if s.Optimize {
-		optimizeVal = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("Yes (VACUUM ANALYZE after restore)")
+		optimizeValue = "OPTIMIZE"
+		optimizeKind = badgeSuccess
 	}
-
-	settingsRows := []struct{ label, value string }{
-		{"[c] Clean", cleanVal},
-		{"[m] Create DB", createDbVal},
-		{"[o] Optimize", optimizeVal},
-		{"[+/-] Jobs", fmt.Sprintf("%d parallel processes", s.Jobs)},
-		{"Format", s.Format},
-	}
-
-	for _, row := range settingsRows {
-		label := lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render(row.label + ":")
-		val := lipgloss.NewStyle().Foreground(colorSubtext).Render(row.value)
-		sb.WriteString("  " + label + " " + val + "\n")
-	}
-
-	// Filter display
-	if len(s.IncludeSchema) > 0 {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Inc Schema:") + " " + strings.Join(s.IncludeSchema, ", ") + "\n")
-	}
-	if len(s.ExcludeSchema) > 0 {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Exc Schema:") + " " + strings.Join(s.ExcludeSchema, ", ") + "\n")
-	}
-	if len(s.IncludeTable) > 0 {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Inc Table:") + " " + strings.Join(s.IncludeTable, ", ") + "\n")
-	}
-	if len(s.ExcludeTable) > 0 {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Exc Table:") + " " + strings.Join(s.ExcludeTable, ", ") + "\n")
-	}
+	options := renderKeyValueGrid([]kvRow{
+		{Label: "Clean", Value: cleanValue, Kind: cleanKind},
+		{Label: "Create DB", Value: createValue, Kind: createKind},
+		{Label: "Optimize", Value: optimizeValue, Kind: optimizeKind},
+	}, 12)
+	options += "\n" + renderFilterRows(s.IncludeSchema, s.ExcludeSchema, s.IncludeTable, s.ExcludeTable)
+	body.WriteString(renderCard(m.width, "Restore Options", options))
 
 	if s.Clean {
-		sb.WriteString("\n  " + renderDanger("Clean mode may drop database objects before restore.") + "\n")
+		body.WriteString("\n")
+		body.WriteString(renderCard(m.width, "Safety Review", renderDanger("Clean mode may drop database objects before restore.")))
 	}
 
-	sb.WriteString("\n")
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorWarning).Bold(true).Render(
-		"  ! Press Enter to execute database restoration.\n"))
-	sb.WriteString("\n")
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  [c] clean   [m] create-db   [o] optimize   [+/-] jobs   [t/T] table   [h/H] schema   [Enter] proceed   [esc] back\n"))
-	return sb.String()
+	return renderScreenFrame(m.width, "Confirm Restore", "Pre-flight review before database restore", body.String(), []keyHint{
+		{Key: "C", Label: "clean"},
+		{Key: "M", Label: "create-db"},
+		{Key: "O", Label: "optimize"},
+		{Key: "+/-", Label: "jobs"},
+		{Key: "T/H", Label: "filters"},
+		{Key: "Enter", Label: "proceed"},
+		{Key: "Esc", Label: "back", Danger: true},
+	})
 }
 
 // --- Helpers ---
@@ -1162,6 +1111,31 @@ func (m Model) initFormFields(p *config.Profile) []textinput.Model {
 	return inputs
 }
 
+func (m *Model) startProfileForm(p *config.Profile, isEditing bool) {
+	m.inputs = m.initFormFields(p)
+	m.focusedIdx = 0
+	m.isEditing = isEditing
+	m.formErr = ""
+	m.formInfo = defaultManualRuntimeMessage()
+	m.formNotice = ""
+	m.formRuntime = nil
+	m.formRuntimeDetails = false
+	m.runtimeDetecting = false
+	m.runtimeDetectPct = 0
+	m.runtimeDetectText = ""
+	m.origName = ""
+	if p != nil {
+		m.formRuntime = cloneRuntimeProfile(p.Runtime)
+		if p.Runtime != nil {
+			m.formInfo = formatRuntimeSummary(p.Runtime)
+			m.formRuntimeDetails = true
+		}
+		if isEditing {
+			m.origName = p.Name
+		}
+	}
+}
+
 func (m Model) updateEditProfileForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	keyMsg, ok := msg.(tea.KeyMsg)
 	if !ok {
@@ -1171,6 +1145,29 @@ func (m Model) updateEditProfileForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch keyMsg.String() {
 	case "esc":
 		m.step = stepSelectProfile
+		return m, nil
+	case "f2", "ctrl+r":
+		if m.runtimeDetecting {
+			return m, nil
+		}
+		return m.detectProfileRuntime()
+	}
+
+	if m.runtimeDetecting {
+		return m, nil
+	}
+
+	switch keyMsg.String() {
+	case "f3":
+		if m.formRuntime != nil {
+			m.formRuntimeDetails = !m.formRuntimeDetails
+		}
+		return m, nil
+	case "f4":
+		m.formRuntime = nil
+		m.formInfo = defaultManualRuntimeMessage()
+		m.formNotice = "Runtime metadata cleared. Connection fields stay unchanged."
+		m.formRuntimeDetails = false
 		return m, nil
 
 	case "tab", "shift+tab", "up", "down", "enter":
@@ -1252,6 +1249,20 @@ func (m Model) saveProfileForm() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 
+	if m.cfg.Profiles == nil {
+		m.cfg.Profiles = make(map[string]config.Profile)
+	}
+
+	// Preserve metadata that is managed by profile import/runtime detection and
+	// is not exposed in the text fields.
+	runtime := cloneRuntimeProfile(m.formRuntime)
+	if runtime == nil && m.isEditing {
+		if existing, ok := m.cfg.Profiles[m.origName]; ok {
+			runtime = cloneRuntimeProfile(existing.Runtime)
+		}
+	}
+	wasActiveProfile := m.isEditing && m.result.Profile.Name == m.origName
+
 	// Update Config
 	if m.isEditing && name != m.origName {
 		delete(m.cfg.Profiles, m.origName)
@@ -1264,6 +1275,7 @@ func (m Model) saveProfileForm() (tea.Model, tea.Cmd) {
 		User:     user,
 		Password: pass,
 		Database: dbName,
+		Runtime:  runtime,
 	}
 
 	if err := config.SaveConfig(m.cfg); err != nil {
@@ -1272,6 +1284,9 @@ func (m Model) saveProfileForm() (tea.Model, tea.Cmd) {
 	}
 
 	// Reload profiles list
+	if wasActiveProfile {
+		m.result.Profile.Name = name
+	}
 	m.reloadProfiles()
 
 	// Return to profile selection
@@ -1303,15 +1318,7 @@ func (m Model) updateConfirmDelete(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *Model) reloadProfiles() {
-	profiles := make([]config.Profile, 0, len(m.cfg.Profiles))
-	for k, p := range m.cfg.Profiles {
-		p.Name = k
-		profiles = append(profiles, p)
-	}
-	sort.Slice(profiles, func(i, j int) bool {
-		return profiles[i].Name < profiles[j].Name
-	})
-	m.profiles = profiles
+	m.profiles = profilesFromConfig(m.cfg)
 
 	if m.result.Profile.Name != "" {
 		if p, ok := m.cfg.Profiles[m.result.Profile.Name]; ok {
@@ -1323,21 +1330,31 @@ func (m *Model) reloadProfiles() {
 	}
 }
 
-func (m Model) viewEditProfileForm() string {
-	var sb strings.Builder
-
-	titleStr := "dbtool — Add Connection Profile"
-	if m.isEditing {
-		titleStr = fmt.Sprintf("dbtool — Edit Profile: %s", m.origName)
+func profilesFromConfig(cfg *config.Config) []config.Profile {
+	if cfg == nil {
+		return nil
 	}
 
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render(titleStr)
-	sb.WriteString(title + "\n\n")
+	profiles := make([]config.Profile, 0, len(cfg.Profiles))
+	for name, p := range cfg.Profiles {
+		p.Name = name
+		profiles = append(profiles, p)
+	}
+	sort.Slice(profiles, func(i, j int) bool {
+		return profiles[i].Name < profiles[j].Name
+	})
+	return profiles
+}
+
+func (m Model) viewEditProfileForm() string {
+	var body strings.Builder
+
+	title := "Add Connection Profile"
+	subtitle := "Manual connection setup"
+	if m.isEditing {
+		title = fmt.Sprintf("Edit Profile: %s", m.origName)
+		subtitle = "Update connection settings and runtime metadata"
+	}
 
 	labels := []string{
 		"Profile Name:",
@@ -1354,17 +1371,126 @@ func (m Model) viewEditProfileForm() string {
 		label := lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render(labels[i])
 		formContent += "  " + label + " " + m.inputs[i].View() + "\n"
 	}
-
-	sb.WriteString(renderPanel(m.width, formContent))
-	sb.WriteString("\n")
-
+	body.WriteString(renderCard(m.width, "Connection Fields", strings.TrimRight(formContent, "\n")))
+	body.WriteString("\n")
+	body.WriteString(m.renderRuntimeStatusCard())
+	if m.formRuntime != nil && m.formRuntimeDetails {
+		body.WriteString("\n")
+		body.WriteString(m.renderRuntimeDetailsCard())
+	}
 	if m.formErr != "" {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")).Bold(true).Render("Error: "+m.formErr) + "\n\n")
+		body.WriteString("\n")
+		body.WriteString(renderCard(m.width, "Validation Error", errorStyle.Render(m.formErr)))
 	}
 
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  [tab/shift+tab/up/down] navigate   [Enter] save on last field   [esc] cancel\n"))
-	return sb.String()
+	return renderScreenFrame(m.width, title, subtitle, body.String(), m.editProfileFormHints())
+}
+
+func (m Model) renderRuntimeStatusCard() string {
+	if m.runtimeDetecting {
+		rows := []kvRow{{Label: "State", Value: "DETECTING", Kind: badgePrimary}}
+		body := renderKeyValueGrid(rows, 0)
+		body += "\n" + renderProgressBar(progressWidth(m.width), m.runtimeDetectPct)
+		if m.runtimeDetectText != "" {
+			body += "\n" + subtextStyle.Render(truncateMiddle(m.runtimeDetectText, safePanelWidth(m.width)-4))
+		}
+		return renderCard(m.width, "Runtime Detection", body)
+	}
+
+	stateLabel, stateKind := runtimeStateBadge(m.formRuntime, m.formNotice)
+	sourceLabel, sourceKind := runtimeSourceBadge(m.formRuntime)
+	rows := []kvRow{{Label: "State", Value: stateLabel, Kind: stateKind}}
+	if sourceLabel != "" {
+		rows = append(rows, kvRow{Label: "Source", Value: sourceLabel, Kind: sourceKind})
+	}
+	body := renderKeyValueGrid(rows, 0)
+	message := m.formInfo
+	if m.formNotice != "" {
+		message = m.formNotice
+	}
+	if message != "" {
+		body += "\n" + subtextStyle.Render(truncateMiddle(message, safePanelWidth(m.width)-4))
+	}
+	return renderCard(m.width, "Runtime Detection", body)
+}
+
+func (m Model) renderRuntimeDetailsCard() string {
+	rows := runtimeDetailRows(m.formRuntime)
+	body := renderKeyValueGrid(rows, 13)
+	return renderCard(m.width, "Docker Runtime Details", body)
+}
+
+func (m Model) editProfileFormHints() []keyHint {
+	detailsLabel := "show details"
+	clearLabel := "clear runtime"
+	if m.formRuntimeDetails {
+		detailsLabel = "hide details"
+	}
+	if m.formRuntime == nil {
+		clearLabel = "clear runtime"
+	}
+	return []keyHint{
+		{Key: "Tab/Shift+Tab", Label: "navigate"},
+		{Key: "F2/Ctrl+R", Label: "detect runtime"},
+		{Key: "F3", Label: detailsLabel},
+		{Key: "F4", Label: clearLabel},
+		{Key: "Enter", Label: "save on last field"},
+		{Key: "Esc", Label: "cancel", Danger: true},
+	}
+}
+
+func runtimeStateBadge(runtimeProfile *config.RuntimeProfile, notice string) (string, badgeKind) {
+	if runtimeProfile != nil {
+		return "DOCKER DETECTED", badgeSuccess
+	}
+	if notice != "" {
+		return "NO MATCH", badgeWarning
+	}
+	return "MANUAL", badgeNeutral
+}
+
+func runtimeSourceBadge(runtimeProfile *config.RuntimeProfile) (string, badgeKind) {
+	if runtimeProfile == nil {
+		return "", badgeNeutral
+	}
+	switch runtimeProfile.Source {
+	case "docker-cli":
+		return "LIVE CONTAINER", badgeSuccess
+	case "docker-compose":
+		return "COMPOSE FALLBACK", badgeWarning
+	default:
+		return strings.ToUpper(runtimeProfile.Source), badgePrimary
+	}
+}
+
+func runtimeDetailRows(runtimeProfile *config.RuntimeProfile) []kvRow {
+	rows := []kvRow{}
+	if runtimeProfile == nil {
+		return rows
+	}
+	rows = append(rows, kvRow{Label: "Runtime", Value: strings.ToUpper(runtimeProfile.Type), Kind: badgePrimary})
+	if runtimeProfile.Source != "" {
+		rows = append(rows, kvRow{Label: "Source", Value: runtimeProfile.Source})
+	}
+	if runtimeProfile.ServiceName != "" {
+		rows = append(rows, kvRow{Label: "Service", Value: runtimeProfile.ServiceName})
+	}
+	if runtimeProfile.Container != "" {
+		rows = append(rows, kvRow{Label: "Container", Value: runtimeProfile.Container})
+	}
+	if runtimeProfile.SourceFile != "" {
+		rows = append(rows, kvRow{Label: "Compose File", Value: filepath.Base(runtimeProfile.SourceFile)})
+	}
+	if len(runtimeProfile.Mounts) > 0 {
+		rows = append(rows, kvRow{Label: "Mounts", Value: fmt.Sprintf("%d", len(runtimeProfile.Mounts))})
+	}
+	if runtimeProfile.Paths.DataDirectory != "" {
+		rows = append(rows, kvRow{Label: "Data Dir", Value: runtimeProfile.Paths.DataDirectory})
+	}
+	if runtimeProfile.Paths.HostHBAFile != "" {
+		rows = append(rows, kvRow{Label: "Host HBA", Value: runtimeProfile.Paths.HostHBAFile})
+	}
+	return rows
 }
 
 func (m Model) viewConfirmDelete() string {
@@ -1463,34 +1589,24 @@ func (m Model) viewRestoring() string {
 }
 
 func (m Model) viewRestoreResult() string {
-	var sb strings.Builder
-
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render("dbtool — Restoration Result")
-	sb.WriteString(title + "\n\n")
+	var body strings.Builder
 
 	if m.result.Settings.DryRun {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Dry Run Completed Successfully") + "\n\n")
-		sb.WriteString("  Command that would run:\n")
-		sb.WriteString(renderPanel(m.width, m.dryRunOutput) + "\n\n")
+		body.WriteString(renderCard(m.width, "✓ Dry Run Completed", "Command that would run:\n"+m.dryRunOutput))
 	} else if m.restoreErr != nil {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")).Bold(true).Render("❌ Restoration Failed") + "\n\n")
-		sb.WriteString("  Error details:\n")
-		sb.WriteString(renderPanel(m.width, m.restoreErr.Error()) + "\n\n")
+		body.WriteString(renderCard(m.width, "! Restore Failed", errorStyle.Render(m.restoreErr.Error())))
 	} else {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("✓ Database Restored Successfully!") + "\n\n")
-		sb.WriteString("  Profile: " + valueStyle.Render(m.result.Profile.Name) + "\n")
-		sb.WriteString("  Database: " + valueStyle.Render(m.result.Profile.Database) + "\n")
-		sb.WriteString("  Dump File: " + valueStyle.Render(m.result.File) + "\n\n")
+		body.WriteString(renderCard(m.width, "✓ Restore Completed", renderKeyValueGrid([]kvRow{
+			{Label: "Profile", Value: m.result.Profile.Name},
+			{Label: "Database", Value: m.result.Profile.Database},
+			{Label: "File", Value: truncateMiddle(m.result.File, safePanelWidth(m.width)-12)},
+		}, 10)))
 	}
 
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  Press any key to do another operation • Q / Esc to quit\n"))
-	return sb.String()
+	return renderScreenFrame(m.width, "Restoration Result", "Final state", body.String(), []keyHint{
+		{Key: "Any key", Label: "another operation"},
+		{Key: "Q/Esc", Label: "quit", Danger: true},
+	})
 }
 
 func (m Model) updateSelectMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
@@ -1544,41 +1660,33 @@ func (m Model) hasActiveProfile() bool {
 }
 
 func (m Model) viewSelectMode() string {
-	var sb strings.Builder
-
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render("dbtool — Select Operation")
-	sb.WriteString(title + "\n\n")
+	var body strings.Builder
 
 	if m.hasActiveProfile() {
 		p := m.result.Profile
-		badge := renderBadge(p.Driver, "#A78BFA")
-		conn := lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %s:%d/%s", p.Host, p.Port, p.Database))
-		sb.WriteString("  Active: " +
-			lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(p.Name) + " " + badge + conn + "\n\n")
+		body.WriteString(renderProfileSummaryCard(m.width, "Active Profile", p.Name, p.Driver, p.Host, p.Port, p.Database, p.User))
+		body.WriteString("\n\n")
 	}
 
-	sb.WriteString(renderRow(false, "Choose what you want to do:") + "\n\n")
-	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("  [R]  ") +
-		lipgloss.NewStyle().Foreground(colorText).Render("Restore") + " — Import a dump file into a database\n\n")
-	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("  [D]  ") +
-		lipgloss.NewStyle().Foreground(colorText).Render("Dump") + "    — Export a database to a dump file\n\n")
-	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("  [M]  ") +
-		lipgloss.NewStyle().Foreground(colorText).Render("Migrate") + " — Copy a database from one profile to another\n\n")
+	body.WriteString(renderSectionTitle("Choose an operation"))
+	body.WriteString("\n\n")
+	body.WriteString(renderOperationCard(m.width, "R", "Restore", "TARGET DB", "Import a dump file into a database"))
+	body.WriteString("\n")
+	body.WriteString(renderOperationCard(m.width, "D", "Dump", "BACKUP", "Export a database to a dump file"))
+	body.WriteString("\n")
+	body.WriteString(renderOperationCard(m.width, "M", "Migrate", "SRC → DST", "Copy a database between profiles"))
 
-	hint := "\n  Press R, D or M to begin"
+	profileLabel := "choose profile"
 	if m.hasActiveProfile() {
-		hint += " • [p] switch profile"
-	} else {
-		hint += " • [p] choose profile"
+		profileLabel = "switch profile"
 	}
-	hint += " • q to quit\n"
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(hint))
-	return sb.String()
+	return renderScreenFrame(m.width, "Select Operation", "Dark Database Command Center", body.String(), []keyHint{
+		{Key: "R", Label: "restore"},
+		{Key: "D", Label: "dump"},
+		{Key: "M", Label: "migrate"},
+		{Key: "P", Label: profileLabel},
+		{Key: "Q", Label: "quit", Danger: true},
+	})
 }
 
 // ─── Profile selector: route to correct next step based on mode ─────────────
@@ -1701,46 +1809,28 @@ func (m Model) updateDumpConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) viewDumpConfirm() string {
-	var sb strings.Builder
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render("dbtool — Confirm Dump")
-	sb.WriteString(title + "\n\n")
-
+	var body strings.Builder
 	format := m.result.DumpSettings.Format
 	if format == "" {
 		format = "custom"
 	}
-
-	sb.WriteString(renderPanel(m.width,
-		labelStyle.Render("Profile")+" "+valueStyle.Render(m.result.Profile.Name)+"\n"+
-			labelStyle.Render("Host   ")+" "+valueStyle.Render(fmt.Sprintf("%s:%d", m.result.Profile.Host, m.result.Profile.Port))+"\n"+
-			labelStyle.Render("DB     ")+" "+valueStyle.Render(m.result.Profile.Database)+"\n"+
-			labelStyle.Render("Output ")+" "+valueStyle.Render(m.result.DumpFile)+"\n"+
-			labelStyle.Render("Format ")+" "+valueStyle.Render(format),
-	) + "\n")
-
+	p := m.result.Profile
 	s := m.result.DumpSettings
-	if len(s.IncludeSchema) > 0 {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Inc Schema:") + " " + strings.Join(s.IncludeSchema, ", ") + "\n")
-	}
-	if len(s.ExcludeSchema) > 0 {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Exc Schema:") + " " + strings.Join(s.ExcludeSchema, ", ") + "\n")
-	}
-	if len(s.IncludeTable) > 0 {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Inc Table:") + " " + strings.Join(s.IncludeTable, ", ") + "\n")
-	}
-	if len(s.ExcludeTable) > 0 {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render("Exc Table:") + " " + strings.Join(s.ExcludeTable, ", ") + "\n")
-	}
 
-	sb.WriteString("\n")
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  [Enter/Y] dump   [esc] back   [t] inc-table   [T] exc-table   [h] inc-schema   [H] exc-schema\n"))
-	return sb.String()
+	body.WriteString(renderProfileSummaryCard(m.width, "Source Profile", p.Name, p.Driver, p.Host, p.Port, p.Database, p.User))
+	body.WriteString("\n")
+	body.WriteString(renderCard(m.width, "Output File", renderKeyValueGrid([]kvRow{
+		{Label: "Path", Value: truncateMiddle(m.result.DumpFile, safePanelWidth(m.width)-14)},
+		{Label: "Format", Value: strings.ToUpper(format), Kind: badgePrimary},
+	}, 10)))
+	body.WriteString("\n")
+	body.WriteString(renderCard(m.width, "Dump Options", renderFilterRows(s.IncludeSchema, s.ExcludeSchema, s.IncludeTable, s.ExcludeTable)))
+
+	return renderScreenFrame(m.width, "Confirm Dump", "Pre-flight review before exporting source database", body.String(), []keyHint{
+		{Key: "Enter/Y", Label: "dump"},
+		{Key: "T/H", Label: "filters"},
+		{Key: "Esc", Label: "back", Danger: true},
+	})
 }
 
 // ─── Dumping ─────────────────────────────────────────────────────────────────
@@ -1798,30 +1888,22 @@ func (m *Model) finalizeDump(err error) {
 }
 
 func (m Model) viewDumpResult() string {
-	var sb strings.Builder
-
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render("dbtool — Dump Result")
-	sb.WriteString(title + "\n\n")
+	var body strings.Builder
 
 	if m.dumpErr != nil {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")).Bold(true).Render("❌ Dump Failed") + "\n\n")
-		sb.WriteString("  Error details:\n")
-		sb.WriteString(renderPanel(m.width, m.dumpErr.Error()) + "\n\n")
+		body.WriteString(renderCard(m.width, "! Dump Failed", errorStyle.Render(m.dumpErr.Error())))
 	} else {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("✓ Database Dumped Successfully!") + "\n\n")
-		sb.WriteString("  Profile: " + valueStyle.Render(m.result.Profile.Name) + "\n")
-		sb.WriteString("  Database: " + valueStyle.Render(m.result.Profile.Database) + "\n")
-		sb.WriteString("  Output File: " + valueStyle.Render(m.result.DumpFile) + "\n\n")
+		body.WriteString(renderCard(m.width, "✓ Dump Completed", renderKeyValueGrid([]kvRow{
+			{Label: "Profile", Value: m.result.Profile.Name},
+			{Label: "Database", Value: m.result.Profile.Database},
+			{Label: "Output", Value: truncateMiddle(m.result.DumpFile, safePanelWidth(m.width)-12)},
+		}, 10)))
 	}
 
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  Press any key to do another operation • Q / Esc to quit\n"))
-	return sb.String()
+	return renderScreenFrame(m.width, "Dump Result", "Final state", body.String(), []keyHint{
+		{Key: "Any key", Label: "another operation"},
+		{Key: "Q/Esc", Label: "quit", Danger: true},
+	})
 }
 
 // ─── Migrate: destination profile selector ───────────────────────────────────
@@ -1859,30 +1941,26 @@ func (m Model) updateMigrateDestSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) viewMigrateDestSelector() string {
-	var sb strings.Builder
-
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render("dbtool — Select Destination Profile")
-	sb.WriteString(title + "\n\n")
+	var body strings.Builder
 
 	src := m.result.Profile
-	srcBadge := renderBadge(src.Driver, "#A78BFA")
-	sb.WriteString("  Source: " +
-		lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render(src.Name) + " " + srcBadge +
-		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %s:%d/%s", src.Host, src.Port, src.Database)) + "\n\n")
+	body.WriteString(renderProfileSummaryCard(m.width, "Source Profile", src.Name, src.Driver, src.Host, src.Port, src.Database, src.User))
+	body.WriteString("\n\n")
+	body.WriteString(renderSectionTitle("Choose a destination profile"))
+	body.WriteString("\n\n")
 
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorAccent).Render("  Choose the destination profile:\n\n"))
+	if len(m.profiles) == 0 {
+		body.WriteString(renderCard(m.width, "No profiles found", warningStyle.Render("Add another profile before migrating.")))
+	} else {
+		body.WriteString(renderProfileRows(m.width, m.profiles, m.migrateDestIdx, src.Name))
+	}
 
-	sb.WriteString(renderProfileRows(m.profiles, m.migrateDestIdx, src.Name))
-
-	sb.WriteString("\n")
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  [up/down] navigate   [Enter] select   [esc] back   [q] quit\n"))
-	return sb.String()
+	return renderScreenFrame(m.width, "Select Destination Profile", "Target database for profile-to-profile copy", body.String(), []keyHint{
+		{Key: "↑/↓", Label: "navigate"},
+		{Key: "Enter", Label: "select"},
+		{Key: "Esc", Label: "back", Danger: true},
+		{Key: "Q", Label: "quit", Danger: true},
+	})
 }
 
 // ─── Migrate: confirm ────────────────────────────────────────────────────────
@@ -2005,76 +2083,71 @@ func (m Model) updateMigrateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) viewMigrateConfirm() string {
-	var sb strings.Builder
-
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render("dbtool — Confirm Migrate")
-	sb.WriteString(title + "\n\n")
-
+	var body strings.Builder
 	src := m.result.Profile
 	dst := m.result.DestProfile
-
-	srcBadge := renderBadge(src.Driver, "#A78BFA")
-	dstBadge := renderBadge(dst.Driver, "#A78BFA")
-
-	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Source: ") +
-		valueStyle.Render(src.Name) + " " + srcBadge +
-		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %s:%d/%s", src.Host, src.Port, src.Database)) + "\n")
-	sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("Target: ") +
-		valueStyle.Render(dst.Name) + " " + dstBadge +
-		lipgloss.NewStyle().Foreground(colorMuted).Render(fmt.Sprintf("  %s:%d/%s", dst.Host, dst.Port, dst.Database)) + "\n\n")
-
 	s := m.result.MigrateSettings
-	cleanVal := lipgloss.NewStyle().Foreground(colorMuted).Render("No")
+
+	body.WriteString(renderProfileSummaryCard(m.width, "Source Profile", src.Name, src.Driver, src.Host, src.Port, src.Database, src.User))
+	body.WriteString("\n")
+	body.WriteString(lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Align(lipgloss.Center).Width(safePanelWidth(m.width)).Render("SRC → DST"))
+	body.WriteString("\n")
+	body.WriteString(renderProfileSummaryCard(m.width, "Target Profile", dst.Name, dst.Driver, dst.Host, dst.Port, dst.Database, dst.User))
+	body.WriteString("\n")
+
+	cleanValue := "No"
+	cleanKind := badgeNeutral
 	if s.Clean {
-		cleanVal = lipgloss.NewStyle().Foreground(colorWarning).Bold(true).Render("Yes (drop objects first)")
+		cleanValue = "CLEAN"
+		cleanKind = badgeDanger
 	}
-	createDbVal := lipgloss.NewStyle().Foreground(colorMuted).Render("No")
+	createValue := "No"
+	createKind := badgeNeutral
 	if s.CreateIfMissing {
-		createDbVal = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("Yes")
+		createValue = "CREATE"
+		createKind = badgeSuccess
 	}
-	modeVal := lipgloss.NewStyle().Foreground(colorMuted).Render("full (schema + data)")
+	modeValue := "FULL"
+	modeKind := badgePrimary
 	if s.SchemaOnly {
-		modeVal = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("schema-only")
+		modeValue = "SCHEMA ONLY"
 	} else if s.DataOnly {
-		modeVal = lipgloss.NewStyle().Foreground(colorAccent).Bold(true).Render("data-only")
+		modeValue = "DATA ONLY"
 	}
-
-	optimizeVal := lipgloss.NewStyle().Foreground(colorMuted).Render("No")
+	optimizeValue := "No"
+	optimizeKind := badgeNeutral
 	if s.Optimize {
-		optimizeVal = lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("Yes (VACUUM ANALYZE)")
+		optimizeValue = "OPTIMIZE"
+		optimizeKind = badgeSuccess
 	}
 
-	rows := []struct{ label, value string }{
-		{"[c] Clean", cleanVal},
-		{"[m] Create DB", createDbVal},
-		{"[s/a] Mode", modeVal},
-		{"[o] Optimize", optimizeVal},
-		{"Jobs", fmt.Sprintf("%d", s.Jobs)},
-		{"Format", s.Format},
-	}
-	for _, row := range rows {
-		label := lipgloss.NewStyle().Foreground(colorMuted).Width(14).Render(row.label + ":")
-		val := lipgloss.NewStyle().Foreground(colorSubtext).Render(row.value)
-		sb.WriteString("  " + label + " " + val + "\n")
-	}
+	options := renderKeyValueGrid([]kvRow{
+		{Label: "Mode", Value: modeValue, Kind: modeKind},
+		{Label: "Clean", Value: cleanValue, Kind: cleanKind},
+		{Label: "Create DB", Value: createValue, Kind: createKind},
+		{Label: "Optimize", Value: optimizeValue, Kind: optimizeKind},
+		{Label: "Jobs", Value: fmt.Sprintf("%d", s.Jobs)},
+		{Label: "Format", Value: s.Format, Kind: badgePrimary},
+	}, 12)
+	options += "\n" + renderFilterRows(s.IncludeSchema, s.ExcludeSchema, s.IncludeTable, s.ExcludeTable)
+	body.WriteString(renderCard(m.width, "Migrate Options", options))
+	body.WriteString("\n")
 
-	sb.WriteString("\n  " + renderDanger("Migration target may be overwritten during restore phase.") + "\n")
+	safety := renderDanger("Migration target may be overwritten during restore phase.")
 	if s.Clean {
-		sb.WriteString("  " + renderDanger("Clean mode may drop target database objects before migrate restore.") + "\n")
+		safety += "\n" + renderDanger("Clean mode may drop target database objects before migrate restore.")
 	}
+	body.WriteString(renderCard(m.width, "Safety Review", safety))
 
-	sb.WriteString("\n")
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorWarning).Bold(true).Render(
-		"  ! Press Enter to migrate (target may be overwritten).\n"))
-	sb.WriteString("\n")
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  [c] clean   [m] create-db   [s] schema-only   [a] data-only   [o] optimize   [t/T] table   [h/H] schema   [Enter] proceed   [esc] back\n"))
-	return sb.String()
+	return renderScreenFrame(m.width, "Confirm Migrate", "Review source and target before copying data", body.String(), []keyHint{
+		{Key: "C", Label: "clean"},
+		{Key: "M", Label: "create-db"},
+		{Key: "S/A", Label: "mode"},
+		{Key: "O", Label: "optimize"},
+		{Key: "T/H", Label: "filters"},
+		{Key: "Enter", Label: "proceed"},
+		{Key: "Esc", Label: "back", Danger: true},
+	})
 }
 
 // ─── Migrating (2-phase progress) ─────────────────────────────────────────────
@@ -2228,29 +2301,21 @@ func (m *Model) finalizeMigrate(err error) {
 }
 
 func (m Model) viewMigrateResult() string {
-	var sb strings.Builder
-
-	title := lipgloss.NewStyle().
-		Foreground(colorText).
-		Background(colorPrimary).
-		Bold(true).
-		Padding(0, 2).
-		Render("dbtool — Migration Result")
-	sb.WriteString(title + "\n\n")
+	var body strings.Builder
 
 	if m.migrateErr != nil {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(lipgloss.Color("#EF4444")).Bold(true).Render("❌ Migration Failed") + "\n\n")
-		sb.WriteString("  Error details:\n")
-		sb.WriteString(renderPanel(m.width, m.migrateErr.Error()) + "\n\n")
+		body.WriteString(renderCard(m.width, "! Migration Failed", errorStyle.Render(m.migrateErr.Error())))
 	} else {
-		sb.WriteString("  " + lipgloss.NewStyle().Foreground(colorSuccess).Bold(true).Render("✓ Migration Completed Successfully!") + "\n\n")
-		sb.WriteString("  Source: " + valueStyle.Render(m.result.Profile.Name) + " (" + m.result.Profile.Database + ")\n")
-		sb.WriteString("  Target: " + valueStyle.Render(m.result.DestProfile.Name) + " (" + m.result.DestProfile.Database + ")\n\n")
+		body.WriteString(renderCard(m.width, "✓ Migration Completed", renderKeyValueGrid([]kvRow{
+			{Label: "Source", Value: fmt.Sprintf("%s (%s)", m.result.Profile.Name, m.result.Profile.Database)},
+			{Label: "Target", Value: fmt.Sprintf("%s (%s)", m.result.DestProfile.Name, m.result.DestProfile.Database)},
+		}, 10)))
 	}
 
-	sb.WriteString(lipgloss.NewStyle().Foreground(colorMuted).Render(
-		"  Press any key to do another operation • Q / Esc to quit\n"))
-	return sb.String()
+	return renderScreenFrame(m.width, "Migration Result", "Final state", body.String(), []keyHint{
+		{Key: "Any key", Label: "another operation"},
+		{Key: "Q/Esc", Label: "quit", Danger: true},
+	})
 }
 
 // createMigrateTempPath allocates a temp path for the intermediate dump file/dir.

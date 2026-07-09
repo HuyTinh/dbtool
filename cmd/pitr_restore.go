@@ -176,6 +176,10 @@ func runPITRRestore(ctx context.Context) error {
 			sourceProfile.Driver, targetProfile.Driver)
 	}
 
+	if targetProfile.Runtime != nil && targetProfile.Runtime.Type == "docker" {
+		return fmt.Errorf("PITR restore into Docker PostgreSQL is not supported yet: dbtool still manages the data directory and service lifecycle via the local host filesystem/service manager. PITR setup now supports Docker archive_command generation, but restore still requires a local/native PostgreSQL target")
+	}
+
 	if targetProfileName == pitrRestoreProfile {
 		// Already confirmed above
 	} else if targetProfileName != pitrRestoreProfile {
@@ -254,8 +258,8 @@ func runPITRRestore(ctx context.Context) error {
 	// Wait for PostgreSQL to stop
 	time.Sleep(5 * time.Second)
 
-	// Step 7: Get data directory
-	dataDir, err := getDataDirectory(ctx, sourceProfile)
+	// Step 7: Get target data directory
+	dataDir, err := getDataDirectory(ctx, targetProfile)
 	if err != nil {
 		return fmt.Errorf("cannot get data directory: %w", err)
 	}
@@ -278,7 +282,7 @@ func runPITRRestore(ctx context.Context) error {
 
 	// Step 9: Configure recovery
 	fmt.Printf("Configuring recovery...\n")
-	if err := configureRecovery(dataDir, pitrConfig.ArchiveDir, targetTime, selectedBackup.Timeline); err != nil {
+	if err := configureRecovery(targetProfile, dataDir, pitrConfig.ArchiveDir, targetTime, selectedBackup.Timeline); err != nil {
 		// Restore backup
 		os.RemoveAll(dataDir)
 		os.Rename(backupDataDir, dataDir)
@@ -427,7 +431,7 @@ func extractBaseBackup(backupID, baseBackupDir, dataDir string, compressed bool)
 }
 
 // configureRecovery configures PostgreSQL recovery settings
-func configureRecovery(dataDir, archiveDir string, targetTime time.Time, timeline int) error {
+func configureRecovery(profile config.Profile, dataDir, archiveDir string, targetTime time.Time, timeline int) error {
 	// Detect PostgreSQL version (simplified - assume >= 12)
 	// In production, you'd query pg_ctl --version
 
@@ -437,12 +441,10 @@ func configureRecovery(dataDir, archiveDir string, targetTime time.Time, timelin
 		return err
 	}
 
-	// Generate restore_command
-	var restoreCommand string
-	if runtime.GOOS == "windows" {
-		restoreCommand = fmt.Sprintf(`copy "%s\%%f" "%%p"`, archiveDir)
-	} else {
-		restoreCommand = fmt.Sprintf("cp %s/%%f %%p", archiveDir)
+	// Generate restore_command for the PostgreSQL runtime
+	restoreCommand, _, err := pitr.BuildRestoreCommand(profile, archiveDir)
+	if err != nil {
+		return err
 	}
 
 	// Append to postgresql.auto.conf

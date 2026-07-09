@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"dbtool/internal/config"
 	"dbtool/internal/driver"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -52,5 +53,27 @@ func listenToMigrateProgress(ch <-chan driver.Progress, phase int) tea.Cmd {
 			return migratePhaseFinishedMsg{phase: phase}
 		}
 		return migrateProgressMsg(p)
+	}
+}
+
+type runtimeDetectProgressMsg struct {
+	Percent float64
+	Message string
+	Ch      <-chan tea.Msg
+}
+
+type runtimeDetectFinishedMsg struct {
+	Profile config.Profile
+	Message string
+	Err     error
+}
+
+func listenToRuntimeDetect(ch <-chan tea.Msg) tea.Cmd {
+	return func() tea.Msg {
+		msg, ok := <-ch
+		if !ok {
+			return runtimeDetectFinishedMsg{}
+		}
+		return msg
 	}
 }
