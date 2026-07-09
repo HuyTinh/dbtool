@@ -8,6 +8,11 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+const (
+	LegacyConfigVersion  = 0
+	CurrentConfigVersion = 1
+)
+
 type Profile struct {
 	Name     string          `yaml:"-"`
 	Driver   string          `yaml:"driver"`
@@ -42,6 +47,7 @@ type RuntimePaths struct {
 }
 
 type Config struct {
+	Version  int                `yaml:"version,omitempty"`
 	Profiles map[string]Profile `yaml:"profiles"`
 }
 
@@ -72,6 +78,7 @@ func LoadConfig() (*Config, error) {
 	}
 
 	cfg := &Config{
+		Version:  CurrentConfigVersion,
 		Profiles: make(map[string]Profile),
 	}
 
@@ -90,6 +97,12 @@ func LoadConfig() (*Config, error) {
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse profiles.yaml: %w", err)
 	}
+	if cfg.Version == LegacyConfigVersion {
+		cfg.Version = CurrentConfigVersion
+	}
+	if cfg.Profiles == nil {
+		cfg.Profiles = make(map[string]Profile)
+	}
 
 	// Populate name field inside the Profile structs
 	for k, v := range cfg.Profiles {
@@ -104,6 +117,15 @@ func SaveConfig(cfg *Config) error {
 	path, err := GetConfigFilePath()
 	if err != nil {
 		return err
+	}
+	if cfg == nil {
+		cfg = &Config{}
+	}
+	if cfg.Version == LegacyConfigVersion {
+		cfg.Version = CurrentConfigVersion
+	}
+	if cfg.Profiles == nil {
+		cfg.Profiles = make(map[string]Profile)
 	}
 
 	data, err := yaml.Marshal(cfg)

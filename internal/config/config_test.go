@@ -1,6 +1,9 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
 	"gopkg.in/yaml.v3"
@@ -79,5 +82,77 @@ func TestProfileYAMLRuntimeRoundTrip(t *testing.T) {
 	}
 	if got.Runtime.Paths.HostHBAFile != "/repo/pgdata/pg_hba.conf" {
 		t.Fatalf("runtime paths mismatch: %#v", got.Runtime.Paths)
+	}
+}
+
+func TestLoadConfigLegacyVersionlessFileDefaultsToCurrentVersion(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), "AppData", "Roaming")
+	t.Setenv("APPDATA", configDir)
+
+	path, err := GetConfigFilePath()
+	if err != nil {
+		t.Fatalf("GetConfigFilePath: %v", err)
+	}
+
+	legacy := `profiles:
+  local:
+    driver: postgres
+    host: localhost
+    port: 5432
+    user: postgres
+    database: app
+    password: secret
+`
+	if err := os.WriteFile(path, []byte(legacy), 0600); err != nil {
+		t.Fatalf("write legacy config: %v", err)
+	}
+
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.Version != CurrentConfigVersion {
+		t.Fatalf("cfg.Version = %d, want %d", cfg.Version, CurrentConfigVersion)
+	}
+	if _, ok := cfg.GetProfile("local"); !ok {
+		t.Fatalf("expected legacy profile to load")
+	}
+}
+
+func TestSaveConfigWritesCurrentVersion(t *testing.T) {
+	configDir := filepath.Join(t.TempDir(), "AppData", "Roaming")
+	t.Setenv("APPDATA", configDir)
+
+	cfg := &Config{
+		Profiles: map[string]Profile{
+			"local": {
+				Driver:   "postgres",
+				Host:     "localhost",
+				Port:     5432,
+				User:     "postgres",
+				Database: "app",
+				Password: "secret",
+			},
+		},
+	}
+
+	if err := SaveConfig(cfg); err != nil {
+		t.Fatalf("SaveConfig: %v", err)
+	}
+	if cfg.Version != CurrentConfigVersion {
+		t.Fatalf("cfg.Version after save = %d, want %d", cfg.Version, CurrentConfigVersion)
+	}
+
+	path, err := GetConfigFilePath()
+	if err != nil {
+		t.Fatalf("GetConfigFilePath: %v", err)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read saved config: %v", err)
+	}
+	if !strings.Contains(string(data), "version: 1") {
+		t.Fatalf("saved config missing version header:\n%s", string(data))
 	}
 }
