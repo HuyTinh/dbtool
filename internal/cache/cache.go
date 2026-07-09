@@ -63,6 +63,11 @@ func NewFileCache() (*FileCache, error) {
 	return &FileCache{baseDir: dir}, nil
 }
 
+// Dir returns the base directory where cache files are stored.
+func (c *FileCache) Dir() (string, error) {
+	return c.baseDir, nil
+}
+
 func (c *FileCache) getNamespaceDir(namespace string) (string, error) {
 	dir := filepath.Join(c.baseDir, namespace)
 	if err := os.MkdirAll(dir, 0700); err != nil {

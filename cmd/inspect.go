@@ -1,10 +1,10 @@
 package cmd
 
 import (
-	"bufio"
 	"fmt"
-	"os/exec"
 	"strings"
+
+	"dbtool/internal/integrity"
 
 	"github.com/spf13/cobra"
 )
@@ -20,60 +20,18 @@ var inspectCmd = &cobra.Command{
 			return err
 		}
 
-		// Run native pg_restore -l command to read Table of Contents (TOC)
-		prCmd := exec.Command("pg_restore", "-l", filePath)
-		out, err := prCmd.Output()
+		entries, version, err := integrity.ParseTOC(filePath)
 		if err != nil {
 			return fmt.Errorf("failed to read archive TOC (file might be plain SQL or corrupt, or pg_restore is not in PATH): %w", err)
 		}
 
-		type dbObject struct {
-			Type   string
-			Schema string
-			Name   string
-			Owner  string
-		}
-
-		var tables []dbObject
-		var views []dbObject
-
-		scanner := bufio.NewScanner(strings.NewReader(string(out)))
-		for scanner.Scan() {
-			line := strings.TrimSpace(scanner.Text())
-			if line == "" || strings.HasPrefix(line, ";") {
-				continue
-			}
-
-			// Format of pg_restore -l lines:
-			// 3125; 16400 16405 TABLE public orders postgres
-			parts := strings.SplitN(line, ";", 2)
-			if len(parts) < 2 {
-				continue
-			}
-
-			fields := strings.Fields(parts[1])
-			if len(fields) < 5 {
-				continue
-			}
-
-			objType := fields[2]
-			schema := fields[3]
-			name := fields[4]
-			owner := ""
-			if len(fields) > 5 {
-				owner = fields[5]
-			}
-
-			obj := dbObject{Type: objType, Schema: schema, Name: name, Owner: owner}
-			switch objType {
-			case "TABLE":
-				tables = append(tables, obj)
-			case "VIEW", "MATERIALIZED VIEW":
-				views = append(views, obj)
-			}
-		}
+		tables := entries.Tables()
+		views := entries.Views()
 
 		fmt.Printf("\nDump File Archive: %s\n", filePath)
+		if version != "" {
+			fmt.Printf("PostgreSQL version: %s\n", version)
+		}
 		fmt.Println(strings.Repeat("=", 60))
 
 		fmt.Printf("\nTables (%d):\n", len(tables))

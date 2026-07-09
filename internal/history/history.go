@@ -31,6 +31,8 @@ type HistoryRecord struct {
 	Success   bool      `json:"success"`
 	Command   string    `json:"command"`
 	Error     string    `json:"error,omitempty"`
+	Checksum  string    `json:"checksum,omitempty"`
+	FileSize  int64     `json:"file_size,omitempty"`
 }
 
 func getHistoryFilePath() (string, error) {

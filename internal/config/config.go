@@ -9,13 +9,36 @@ import (
 )
 
 type Profile struct {
-	Name     string `yaml:"-"`
-	Driver   string `yaml:"driver"`
-	Host     string `yaml:"host"`
-	Port     int    `yaml:"port"`
-	User     string `yaml:"user"`
-	Database string `yaml:"database"`
-	Password string `yaml:"password"`
+	Name     string          `yaml:"-"`
+	Driver   string          `yaml:"driver"`
+	Host     string          `yaml:"host"`
+	Port     int             `yaml:"port"`
+	User     string          `yaml:"user"`
+	Database string          `yaml:"database"`
+	Password string          `yaml:"password"`
+	Runtime  *RuntimeProfile `yaml:"runtime,omitempty"`
+}
+
+type RuntimeProfile struct {
+	Type        string         `yaml:"type,omitempty"`
+	Source      string         `yaml:"source,omitempty"`
+	SourceFile  string         `yaml:"source_file,omitempty"`
+	ServiceName string         `yaml:"service_name,omitempty"`
+	Container   string         `yaml:"container,omitempty"`
+	Mounts      []MountMapping `yaml:"mounts,omitempty"`
+	Paths       RuntimePaths   `yaml:"paths,omitempty"`
+}
+
+type MountMapping struct {
+	Type   string `yaml:"type,omitempty"`
+	Source string `yaml:"source,omitempty"`
+	Target string `yaml:"target,omitempty"`
+}
+
+type RuntimePaths struct {
+	DataDirectory string `yaml:"data_directory,omitempty"`
+	HBAFile       string `yaml:"hba_file,omitempty"`
+	HostHBAFile   string `yaml:"host_hba_file,omitempty"`
 }
 
 type Config struct {

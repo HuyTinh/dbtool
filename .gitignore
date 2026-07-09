@@ -38,3 +38,6 @@ profiles.yaml
 *.sql
 *.dump
 *.backup
+
+.hermes/
+docs/

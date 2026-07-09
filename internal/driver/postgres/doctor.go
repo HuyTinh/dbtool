@@ -204,3 +204,46 @@ func parseMajorVersion(verStr string) (int, error) {
 	}
 	return major, nil
 }
+
+func (d *PostgresDriver) EnsureDatabaseExists(ctx context.Context, profile config.Profile) error {
+	// Check connection to target DB first
+	err := d.TestConnection(ctx, profile)
+	if err == nil {
+		return nil
+	}
+
+	// Try to connect to "postgres" system database
+	sysProfile := profile
+	sysProfile.Database = "postgres"
+	dsn := fmt.Sprintf(
+		"postgres://%s:%s@%s:%d/%s?connect_timeout=3",
+		sysProfile.User, sysProfile.Password, sysProfile.Host, sysProfile.Port, sysProfile.Database,
+	)
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("failed to connect to system database 'postgres' to check/create target database: %w", err)
+	}
+	defer conn.Close(ctx)
+
+	// Check if target database exists
+	var exists bool
+	query := "SELECT EXISTS(SELECT 1 FROM pg_database WHERE datname = $1)"
+	err = conn.QueryRow(ctx, query, profile.Database).Scan(&exists)
+	if err != nil {
+		return fmt.Errorf("failed to check if database exists: %w", err)
+	}
+
+	if exists {
+		return nil
+	}
+
+	// Create database using sanitized name
+	safeDBName := pgx.Identifier{profile.Database}.Sanitize()
+	_, err = conn.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s", safeDBName))
+	if err != nil {
+		return fmt.Errorf("failed to create database %s: %w", profile.Database, err)
+	}
+
+	return nil
+}
