@@ -93,15 +93,16 @@ func LoadConfig() (*Config, error) {
 	if err != nil {
 		return nil, err
 	}
+	version, err := detectConfigVersion(data)
+	if err != nil {
+		return nil, err
+	}
 
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("failed to parse profiles.yaml: %w", err)
 	}
-	if cfg.Version == LegacyConfigVersion {
-		cfg.Version = CurrentConfigVersion
-	}
-	if cfg.Profiles == nil {
-		cfg.Profiles = make(map[string]Profile)
+	if _, err := migrateConfig(cfg, version); err != nil {
+		return nil, err
 	}
 
 	// Populate name field inside the Profile structs
