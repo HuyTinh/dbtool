@@ -13,6 +13,9 @@ const (
 	ModeRestore Mode = iota
 	ModeDump
 	ModeMigrate
+	ModePITR
+	ModeHealth
+	ModeSchemaAttributes
 )
 
 // RestoreSettings holds target configuration for dbtool restore command

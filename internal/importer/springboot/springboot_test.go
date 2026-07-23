@@ -180,7 +180,7 @@ func TestDetect_FindsConfigFiles(t *testing.T) {
 		"application.yml",
 		"application-dev.properties",
 		"application-prod.yaml",
-		"not_application.yml",  // should not be found
+		"not_application.yml",    // should not be found
 		"application_config.xml", // should not be found
 	}
 	for _, name := range files {

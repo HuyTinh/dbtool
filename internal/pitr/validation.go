@@ -224,7 +224,7 @@ func DetectPostgreSQLVersion() int {
 
 // runCommand runs a command and returns its output
 func runCommand(name string, args ...string) (string, error) {
-	cmd := fmt.Sprintf("%s", name)
+	cmd := name
 	for _, arg := range args {
 		cmd += " " + arg
 	}

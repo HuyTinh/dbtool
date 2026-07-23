@@ -93,6 +93,10 @@ func ParseTOC(filePath string) (TOCEntryList, string, error) {
 			objType = "MATERIALIZED VIEW"
 			schemaIdx = 4
 		}
+		if objType == "TABLE" && len(fields) > 3 && fields[3] == "DATA" {
+			objType = "TABLE DATA"
+			schemaIdx = 4
+		}
 
 		if schemaIdx+2 > len(fields) {
 			continue

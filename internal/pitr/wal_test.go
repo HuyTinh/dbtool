@@ -7,12 +7,12 @@ import (
 
 func TestParseWALFilename(t *testing.T) {
 	tests := []struct {
-		name      string
-		filename  string
-		wantErr   bool
-		timeline  int
-		log       int
-		segment   int
+		name     string
+		filename string
+		wantErr  bool
+		timeline int
+		log      int
+		segment  int
 	}{
 		{
 			name:     "valid WAL filename",

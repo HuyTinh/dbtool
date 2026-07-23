@@ -40,23 +40,25 @@ var migrateCmd = &cobra.Command{
 	Use:   "migrate",
 	Short: "Migrate database schema and data from one profile to another",
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return ExecuteMigrateLogic(cmd.Context(), MigrateOptions{
-			FromName:        migrateFrom,
-			ToName:          migrateTo,
-			Format:          driver.Format(migrateFormat),
-			SchemaOnly:      migrateSchemaOnly,
-			DataOnly:        migrateDataOnly,
-			Clean:           migrateClean,
-			CreateIfMissing: migrateCreateIfMissing,
-			Jobs:            migrateJobs,
-			KeepTemp:        migrateKeepTemp,
-			Optimize:        migrateOptimize,
-			VerifyPost:      migrateVerifyPost,
-			IncludeTable:    migrateIncludeTable,
-			ExcludeTable:    migrateExcludeTable,
-			IncludeSchema:   migrateIncludeSchema,
-			ExcludeSchema:   migrateExcludeSchema,
-			DryRun:          migrateDryRun,
+		return runWithTimeout(cmd, cmd.Context(), func(ctx context.Context) error {
+			return ExecuteMigrateLogic(ctx, MigrateOptions{
+				FromName:        migrateFrom,
+				ToName:          migrateTo,
+				Format:          driver.Format(migrateFormat),
+				SchemaOnly:      migrateSchemaOnly,
+				DataOnly:        migrateDataOnly,
+				Clean:           migrateClean,
+				CreateIfMissing: migrateCreateIfMissing,
+				Jobs:            migrateJobs,
+				KeepTemp:        migrateKeepTemp,
+				Optimize:        migrateOptimize,
+				VerifyPost:      migrateVerifyPost,
+				IncludeTable:    migrateIncludeTable,
+				ExcludeTable:    migrateExcludeTable,
+				IncludeSchema:   migrateIncludeSchema,
+				ExcludeSchema:   migrateExcludeSchema,
+				DryRun:          migrateDryRun,
+			})
 		})
 	},
 }
@@ -152,7 +154,8 @@ func ExecuteMigrateLogic(ctx context.Context, opts MigrateOptions) error {
 		fmt.Printf("  Clean: %v   Create-if-missing: %v   Jobs: %d\n", opts.Clean, opts.CreateIfMissing, opts.Jobs)
 		fmt.Println("\nWould run:")
 		fmt.Println("  1. pg_dump (source) -> temp file")
-		fmt.Println("  2. pg_restore (target) <- temp file")
+		fmt.Println("  2. Inspect dump schemas and create any missing target schemas")
+		fmt.Println("  3. pg_restore (target) <- temp file")
 		fmt.Println("\n(Nothing will be executed. Remove --dry-run to run.)")
 		return nil
 	}
@@ -269,6 +272,11 @@ func ExecuteMigrateLogic(ctx context.Context, opts MigrateOptions) error {
 		}
 	}
 
+	var targetSchemas []string
+	if valErr == nil && valResult != nil {
+		targetSchemas = valResult.SchemaNames
+	}
+
 	// === Safety check on target ===
 	fmt.Println()
 	fmt.Println("Checking target database...")
@@ -292,6 +300,12 @@ func ExecuteMigrateLogic(ctx context.Context, opts MigrateOptions) error {
 	if opts.CreateIfMissing {
 		if err := drv.EnsureDatabaseExists(ctx, dst); err != nil {
 			return fmt.Errorf("failed to ensure target database exists: %w", err)
+		}
+	}
+	if len(targetSchemas) > 0 {
+		fmt.Println("Ensuring target schemas...")
+		if err := drv.EnsureSchemas(ctx, dst, targetSchemas); err != nil {
+			return fmt.Errorf("failed to ensure target schemas: %w", err)
 		}
 	}
 
@@ -398,6 +412,7 @@ func ExecuteMigrateLogic(ctx context.Context, opts MigrateOptions) error {
 	if opts.KeepTemp {
 		fmt.Printf("Temp dump kept at: %s\n", tempPath)
 	}
+	recordFlow(migrateFlow(opts.FromName, opts.ToName, string(format), opts.Jobs, opts.SchemaOnly, opts.DataOnly, opts.Clean, opts.CreateIfMissing, opts.IncludeTable, opts.ExcludeTable, opts.IncludeSchema, opts.ExcludeSchema))
 	return nil
 }
 

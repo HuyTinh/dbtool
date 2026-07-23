@@ -43,7 +43,7 @@ func (f Fingerprint) Key() string {
 
 type cacheEntry struct {
 	SourcePath string          `json:"source_path"`
-	ExpiresAt  time.Time      `json:"expires_at"`
+	ExpiresAt  time.Time       `json:"expires_at"`
 	Value      json.RawMessage `json:"value"`
 }
 

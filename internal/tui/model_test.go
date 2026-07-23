@@ -9,6 +9,7 @@ import (
 	"dbtool/internal/config"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 )
 
 func TestParseFilterValues(t *testing.T) {
@@ -165,6 +166,7 @@ func TestRenderProfileRowsShowsDockerRuntimeBadges(t *testing.T) {
 func TestConfirmViewsShowSafetyWarnings(t *testing.T) {
 	m := NewModel(&config.Config{Profiles: map[string]config.Profile{}}, RestoreSettings{})
 	m.width = 80
+	m.height = 200
 	m.result.Profile = config.Profile{Name: "prod", Driver: "postgres", Host: "localhost", Port: 5432, Database: "app"}
 	m.result.File = "backup.dump"
 	m.result.Settings.Clean = true
@@ -414,17 +416,41 @@ func TestUpdateEditProfileFormF2DetectsDockerRuntime(t *testing.T) {
 
 func TestSelectModeDashboard(t *testing.T) {
 	m := NewModel(&config.Config{Profiles: map[string]config.Profile{}}, RestoreSettings{})
+	m.width = 100
+	m.height = 24
 	out := m.viewSelectMode()
-	for _, want := range []string{"Restore", "Dump", "Migrate", "TARGET DB", "BACKUP", "SRC → DST"} {
+	for _, want := range []string{"DATA MOVEMENT", "DATABASE OPERATIONS", "RECOVERY", "Restore", "Dump", "Migrate", "Schema", "IMPORT", "BACKUP", "SOURCE → TARGET", "PLAN ONLY", "REVIEW → APPLY", "↑↓", "Enter", "Q", "quit"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("select mode missing %q in %q", want, out)
 		}
+	}
+	if got := lipgloss.Height(out); got > m.height {
+		t.Fatalf("select mode height = %d, exceeds terminal height %d:\n%s", got, m.height, out)
+	}
+}
+
+func TestSelectModeArrowNavigationAndEnterOpensFocusedOperation(t *testing.T) {
+	m := NewModel(&config.Config{Profiles: map[string]config.Profile{
+		"local": {Driver: "postgres", Database: "app"},
+	}}, RestoreSettings{})
+	m.result.Profile = m.profiles[0]
+
+	updated, _ := m.updateSelectMode(tea.KeyMsg{Type: tea.KeyDown})
+	m = updated.(Model)
+	if m.operationIdx != 1 {
+		t.Fatalf("operation index after down = %d, want dump", m.operationIdx)
+	}
+	updated, _ = m.updateSelectMode(tea.KeyMsg{Type: tea.KeyEnter})
+	m = updated.(Model)
+	if m.result.Mode != ModeDump || m.step != stepDumpOutputPath {
+		t.Fatalf("Enter opened mode/step = %v/%v, want dump/output path", m.result.Mode, m.step)
 	}
 }
 
 func TestConfirmViewsUseReviewSections(t *testing.T) {
 	m := NewModel(&config.Config{Profiles: map[string]config.Profile{}}, RestoreSettings{})
 	m.width = 90
+	m.height = 200
 	m.result.Profile = config.Profile{Name: "prod", Driver: "postgres", Host: "localhost", Port: 5432, Database: "app", User: "postgres"}
 	m.result.File = "backup.dump"
 	m.result.Settings = RestoreSettings{Format: "custom", Jobs: 4, Clean: true, IncludeTable: []string{"users"}}

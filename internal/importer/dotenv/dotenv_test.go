@@ -21,7 +21,7 @@ func TestDotenvImporter_Detect(t *testing.T) {
 		".env.local",
 		".env.development",
 		".env.example", // should be ignored
-		"app.env",       // should be ignored
+		"app.env",      // should be ignored
 	}
 
 	for _, f := range filesToCreate {

@@ -33,15 +33,19 @@ var historyCmd = &cobra.Command{
 			return nil
 		}
 
-		fmt.Printf("%-25s %-15s %-10s %-40s\n", "TIME", "PROFILE", "STATUS", "DUMP FILE")
-		fmt.Println(strings.Repeat("-", 95))
+		fmt.Printf("%-25s %-15s %-16s %-10s %-32s\n", "TIME", "PROFILE", "OPERATION", "STATUS", "DUMP FILE")
+		fmt.Println(strings.Repeat("-", 115))
 		for _, r := range records {
 			status := "\033[1;32mSUCCESS\033[0m"
 			if !r.Success {
 				status = "\033[1;31mFAILED\033[0m"
 			}
 			timeStr := r.Time.Local().Format("2006-01-02 15:04:05")
-			fmt.Printf("%-25s %-15s %-10s %-40s\n", timeStr, r.Profile, status, r.File)
+			operation := r.Operation
+			if operation == "" {
+				operation = "restore"
+			}
+			fmt.Printf("%-25s %-15s %-16s %-10s %-32s\n", timeStr, r.Profile, operation, status, r.File)
 			if !r.Success && r.Error != "" {
 				fmt.Printf("  -> \033[3mError: %s\033[0m\n", r.Error)
 			}

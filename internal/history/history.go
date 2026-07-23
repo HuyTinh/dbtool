@@ -25,6 +25,7 @@ const (
 )
 
 type HistoryRecord struct {
+	Operation string    `json:"operation,omitempty"`
 	File      string    `json:"file"`
 	Profile   string    `json:"profile"`
 	Time      time.Time `json:"time"`

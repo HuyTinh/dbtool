@@ -1,11 +1,14 @@
-﻿package cmd
+// Package cmd contains dbtool's Cobra command handlers.
+package cmd
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
+	"dbtool/internal/backup"
 	"dbtool/internal/config"
 	"dbtool/internal/driver"
 	"dbtool/internal/driver/postgres"
@@ -18,12 +21,13 @@ import (
 )
 
 var (
-	dumpProfile    string
-	dumpFormat     string
-	dumpIncTables  []string
-	dumpExcTables  []string
-	dumpIncSchemas []string
-	dumpExcSchemas []string
+	dumpProfile           string
+	dumpFormat            string
+	dumpIncTables         []string
+	dumpExcTables         []string
+	dumpIncSchemas        []string
+	dumpExcSchemas        []string
+	dumpManifestRowCounts []string
 )
 
 var dumpCmd = &cobra.Command{
@@ -31,7 +35,9 @@ var dumpCmd = &cobra.Command{
 	Short: "Export a database schema and content into a dump file",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return ExecuteDumpLogic(cmd.Context(), args[0])
+		return runWithTimeout(cmd, cmd.Context(), func(ctx context.Context) error {
+			return ExecuteDumpLogic(ctx, args[0])
+		})
 	},
 }
 
@@ -162,6 +168,31 @@ func ExecuteDumpLogic(ctx context.Context, filePath string) error {
 		if checksum, err := integrity.ComputeFileChecksum(filePath); err == nil {
 			historyRec.Checksum = checksum
 			_ = integrity.WriteChecksumFile(filePath, checksum)
+			entries, archiveVersion, _ := integrity.ParseTOC(filePath)
+			manifest := backup.BuildManifest(backup.Artifact{Path: filePath, Checksum: backup.ChecksumValid}, string(format), archiveVersion, entries)
+			if len(dumpManifestRowCounts) > 0 {
+				if len(dumpManifestRowCounts) > 50 {
+					return fmt.Errorf("manifest row-count is limited to 50 tables")
+				}
+				collector, ok := drv.(driver.RowCountCollector)
+				if !ok {
+					return fmt.Errorf("driver %q does not support manifest row-count collection", profile.Driver)
+				}
+				for _, name := range dumpManifestRowCounts {
+					parts := strings.Split(name, ".")
+					if len(parts) != 2 {
+						return fmt.Errorf("manifest row-count requires schema.table, got %q", name)
+					}
+					counts, err := collector.CollectRowCounts(ctx, profile, []driver.CatalogTable{{Schema: parts[0], Name: parts[1]}})
+					if err != nil {
+						return fmt.Errorf("collect manifest row count for %s: %w", name, err)
+					}
+					for _, count := range counts {
+						manifest.RowCounts = append(manifest.RowCounts, backup.TableRowCount{Schema: count.Schema, Table: count.Table, RowCount: count.RowCount})
+					}
+				}
+			}
+			_ = backup.WriteManifest(filePath, manifest)
 		}
 		if size, err := integrity.FileSize(filePath); err == nil {
 			historyRec.FileSize = size
@@ -175,6 +206,7 @@ func ExecuteDumpLogic(ctx context.Context, filePath string) error {
 		return lastProgress.Err
 	}
 	_ = beeep.Notify("DBTool Dump Success", fmt.Sprintf("Database %s dumped to %s", profile.Database, filePath), "")
+	recordFlow(dumpFlow(profile.Name, filePath, string(format), dumpIncTables, dumpExcTables, dumpIncSchemas, dumpExcSchemas))
 
 	fmt.Println("✓ Database dump completed successfully.")
 	if historyRec.Checksum != "" {
@@ -193,6 +225,7 @@ func init() {
 	dumpCmd.Flags().StringSliceVar(&dumpExcTables, "exclude-table", nil, "Exclude specific table from dump (can be repeated)")
 	dumpCmd.Flags().StringSliceVar(&dumpIncSchemas, "include-schema", nil, "Dump specific schema (can be repeated)")
 	dumpCmd.Flags().StringSliceVar(&dumpExcSchemas, "exclude-schema", nil, "Exclude specific schema from dump (can be repeated)")
+	dumpCmd.Flags().StringSliceVar(&dumpManifestRowCounts, "manifest-row-count", nil, "Record exact row count for a dumped schema.table (can be repeated; max 50)")
 
 	_ = dumpCmd.MarkFlagRequired("profile")
 

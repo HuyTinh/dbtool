@@ -41,8 +41,18 @@ jobs:
       - name: Build
         run: go build ./...
 
+      - name: Check formatting
+        shell: bash
+        run: test -z "$(gofmt -l .)"
+
       - name: Vet
         run: go vet ./...
 
       - name: Test
-        run: go test ./...
+        run: go test -cover ./...
+
+      - name: Staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@v0.7.0 ./...
+
+      - name: Vulnerability check
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.6.0 ./...

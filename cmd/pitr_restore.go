@@ -42,7 +42,7 @@ This command will:
   5. Start PostgreSQL and monitor recovery progress
   6. Verify recovery completion`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runPITRRestore(cmd.Context())
+		return runWithTimeout(cmd, cmd.Context(), runPITRRestore)
 	},
 }
 

@@ -1,0 +1,27 @@
+name: PostgreSQL Integration
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  schema-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Run opt-in PostgreSQL integration tests
+        env:
+          DBTOOL_POSTGRES_INTEGRATION: "1"
+        run: |
+          go test -count=1 ./internal/driver/postgres -run '^(TestEnsureSchemasIntegration|TestCollectHealthIntegration|TestCollectSizeIntegrationListsRelationsAndIndexes|TestCollectSessionsIntegrationFiltersStateAndReturnsBlockers|TestCollectRowCountsIntegrationDetectsRestoredDataMismatch)$'
+          go test -count=1 ./cmd -run '^TestDumpToStrictRestoreDrillIntegration$'

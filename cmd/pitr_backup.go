@@ -31,7 +31,7 @@ var pitrBackupCmd = &cobra.Command{
 The backup will be stored in the configured base backup directory.
 Metadata will be extracted and saved for future restore operations.`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runPITRBackup(cmd.Context())
+		return runWithTimeout(cmd, cmd.Context(), runPITRBackup)
 	},
 }
 

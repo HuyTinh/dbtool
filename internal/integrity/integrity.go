@@ -73,6 +73,9 @@ func VerifyChecksum(filePath string) (bool, error) {
 	if expected == "" {
 		return true, nil
 	}
+	if len(expected) != sha256.Size*2 {
+		return false, fmt.Errorf("invalid checksum sidecar format")
+	}
 
 	actual, err := ComputeFileChecksum(filePath)
 	if err != nil {
