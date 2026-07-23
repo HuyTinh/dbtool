@@ -28,7 +28,7 @@ type RetentionPolicy struct {
 
 // BaseBackupMetadata stores metadata about a base backup
 type BaseBackupMetadata struct {
-	ID         string    `json:"id"`            // Format: 20060102_150405
+	ID         string    `json:"id"` // Format: 20060102_150405
 	StartTime  time.Time `json:"start_time"`
 	EndTime    time.Time `json:"end_time"`
 	Timeline   int       `json:"timeline"`
@@ -43,10 +43,10 @@ type BaseBackupMetadata struct {
 
 // WALFileInfo stores information about a WAL file
 type WALFileInfo struct {
-	Filename string    // "000000010000000000000001"
-	Timeline int       // 1
-	Log      int       // 0
-	Segment  int       // 1
+	Filename string // "000000010000000000000001"
+	Timeline int    // 1
+	Log      int    // 0
+	Segment  int    // 1
 	FullPath string
 	Size     int64
 	ModTime  time.Time

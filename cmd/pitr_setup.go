@@ -41,7 +41,7 @@ This command will:
   4. Generate archive_command for postgresql.conf
   5. Provide instructions for enabling PITR`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return runPITRSetup(cmd.Context())
+		return runWithTimeout(cmd, cmd.Context(), runPITRSetup)
 	},
 }
 

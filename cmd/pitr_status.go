@@ -23,7 +23,9 @@ var pitrStatusCmd = &cobra.Command{
 - WAL archive statistics (count, size, coverage)
 - Recovery range (earliest to latest point)`,
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return ExecutePITRStatus(cmd.Context(), pitrStatusProfile)
+		return runWithTimeout(cmd, cmd.Context(), func(ctx context.Context) error {
+			return ExecutePITRStatus(ctx, pitrStatusProfile)
+		})
 	},
 }
 

@@ -12,6 +12,7 @@ import (
 
 	"dbtool/internal/config"
 	"dbtool/internal/driver"
+	"dbtool/internal/flows"
 	"dbtool/internal/history"
 
 	"github.com/charmbracelet/bubbles/textinput"
@@ -39,9 +40,24 @@ const (
 	stepDumpResult
 	// Migrate-specific
 	stepMigrateSelectDest
+	stepMigratePreflight
 	stepMigrateConfirm
 	stepMigrating
 	stepMigrateResult
+	stepSelectCatalog
+	stepPITRDashboard
+	stepPITRRestoreTarget
+	stepPITRRecoveryPlan
+	stepHealthDashboard
+	stepSizeExplorer
+	stepSessionExplorer
+	stepSessionActionPlan
+	stepFlows
+	stepSchemaAttributeForm
+	stepSchemaAttributePreflight
+	stepSchemaAttributeConfirm
+	stepSchemaAttributeApplying
+	stepSchemaAttributeResult
 	stepDone
 )
 
@@ -74,9 +90,13 @@ type Result struct {
 type Model struct {
 	step step
 
+	// Operation selector
+	operationIdx int
+
 	// Profile selector
-	profiles   []config.Profile
-	profileIdx int
+	profiles              []config.Profile
+	profileIdx            int
+	profileViewportOffset int
 
 	// Form inputs (for Add/Edit)
 	inputs             []textinput.Model
@@ -106,38 +126,81 @@ type Model struct {
 	result Result
 
 	// Restore progress state
-	progressChan <-chan driver.Progress
-	progressPct  float64
-	progressText string
-	restoreErr   error
-	dryRunOutput string
+	progressChan         <-chan driver.Progress
+	progressPct          float64
+	progressText         string
+	restoreErr           error
+	dryRunOutput         string
+	restoreConfirmOffset int
 
 	// Dump state
-	dumpOutputInput  textinput.Model
-	dumpProgressChan <-chan driver.Progress
-	dumpProgressPct  float64
-	dumpProgressText string
-	dumpErr          error
+	dumpOutputInput   textinput.Model
+	dumpProgressChan  <-chan driver.Progress
+	dumpProgressPct   float64
+	dumpProgressText  string
+	dumpErr           error
+	dumpConfirmOffset int
 
 	// Migrate state
-	migrateDestIdx      int
-	migrateTempPath     string
-	migratePhase        int // 0=dump, 1=restore
-	migrateProgressChan <-chan driver.Progress
-	migrateProgressPct  float64
-	migrateProgressText string
-	migrateErr          error
+	migrateDestIdx            int
+	migrateDestViewportOffset int
+	migrateTempPath           string
+	migratePhase              int // 0=dump, 1=restore
+	migrateProgressChan       <-chan driver.Progress
+	migrateProgressPct        float64
+	migrateProgressText       string
+	migrateErr                error
+	migratePreflight          migratePreflightState
+	migrateConfirmOffset      int
 
 	// Filter input mode
 	filterInputMode bool
 	filterInputType string // "include-table", "exclude-table", "include-schema", "exclude-schema"
 	filterInput     textinput.Model
 
+	// PostgreSQL catalog selector (optional driver capability).
+	catalogReturnStep     step
+	catalogTab            int // 0=schema, 1=table
+	catalogIdx            int
+	catalogExclude        bool
+	catalogSchemas        []string
+	catalogTables         []driver.CatalogTable
+	catalogSchemaSelected map[string]bool
+	catalogTableSelected  map[string]bool
+	catalogLoading        bool
+	catalogErr            string
+	catalogSearch         textinput.Model
+	catalogSearching      bool
+
+	// PostgreSQL column attribute editor. It reuses the driver preflight/apply boundary.
+	schemaAttributes schemaAttributeState
+
+	// PITR dashboard and plan-only recovery state.
+	pitr pitrDashboardState
+
+	// Read-only explorer activity indicator shared by health, size, and sessions.
+	activity readOnlyActivityState
+
+	// Read-only database health dashboard state.
+	health healthDashboardState
+
+	// Read-only PostgreSQL size explorer state.
+	size sizeExplorerState
+
+	// Read-only PostgreSQL session explorer state.
+	sessions sessionExplorerState
+
+	// Reusable recent and pinned flows. They retain profile names and safe settings only.
+	flowRecent         []flows.Flow
+	flowPinned         []flows.Flow
+	flowIdx            int
+	flowViewportOffset int
+	flowPinnedTab      bool
+	flowErr            string
+
 	// Terminal size
 	width  int
 	height int
-
-	err error
 }
 
 func NewModel(cfg *config.Config, initSettings RestoreSettings) Model {
@@ -160,16 +223,24 @@ func NewModel(cfg *config.Config, initSettings RestoreSettings) Model {
 	filterInput.CharLimit = 1024
 	filterInput.Width = 80
 
+	catalogSearch := textinput.New()
+	catalogSearch.Placeholder = "type to filter objects..."
+	catalogSearch.CharLimit = 128
+	catalogSearch.Width = 50
+
 	m := Model{
-		step:            stepSelectMode,
-		profiles:        profiles,
-		currentDir:      cwd,
-		width:           80,
-		height:          24,
-		cfg:             cfg,
-		dumpOutputInput: dumpInput,
-		searchInput:     searchInput,
-		filterInput:     filterInput,
+		step:                  stepSelectMode,
+		profiles:              profiles,
+		currentDir:            cwd,
+		width:                 80,
+		height:                24,
+		cfg:                   cfg,
+		dumpOutputInput:       dumpInput,
+		searchInput:           searchInput,
+		filterInput:           filterInput,
+		catalogSearch:         catalogSearch,
+		catalogSchemaSelected: make(map[string]bool),
+		catalogTableSelected:  make(map[string]bool),
 	}
 	m.result.Settings = initSettings
 	m.result.DumpSettings = DumpSettings{Format: "custom"}
@@ -188,6 +259,31 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.WindowSizeMsg:
 		m.width = msg.Width
 		m.height = msg.Height
+		m.clampSizeExplorerOffset()
+		m.clampHealthDashboardOffset()
+		m.clampPITRDocumentOffsets()
+		m.syncSessionExplorerViewport()
+		m.clampMigratePreflightOffset()
+		m.clampConfirmationReviewOffsets()
+		m.clampSchemaAttributeOffset()
+		m.clampFlowsViewport()
+		m.syncProfileSelectorViewport()
+		m.syncMigrateDestSelectorViewport()
+		return m, nil
+
+	case readOnlyActivityTickMsg:
+		at := time.Time(msg)
+		if m.activity.startedAt.IsZero() {
+			m.activity.startedAt = at
+		}
+		m.activity.elapsed = at.Sub(m.activity.startedAt)
+		if m.activity.elapsed < 0 {
+			m.activity.elapsed = 0
+		}
+		m.activity.frame = (m.activity.frame + 1) % len(readOnlyActivityFrames)
+		if m.readOnlyActivityLoading() {
+			return m, nextReadOnlyActivityTick()
+		}
 		return m, nil
 
 	case progressMsg:
@@ -239,6 +335,143 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.runtimeDetectText = ""
 		return m.finishRuntimeDetection(msg)
 
+	case catalogSchemasLoadedMsg:
+		m.catalogLoading = false
+		if msg.err != nil {
+			m.catalogErr = msg.err.Error()
+			return m, nil
+		}
+		m.catalogSchemas = msg.schemas
+		return m, nil
+
+	case catalogTablesLoadedMsg:
+		m.catalogLoading = false
+		if msg.err != nil {
+			m.catalogErr = msg.err.Error()
+			return m, nil
+		}
+		m.catalogTables = msg.tables
+		return m, nil
+
+	case healthLoadedMsg:
+		m.health.loading = false
+		m.health.err = msg.err
+		m.health.snapshot = msg.snapshot
+		m.clampHealthDashboardOffset()
+		return m, nil
+
+	case sizeLoadedMsg:
+		m.size.loading = false
+		m.size.err = msg.err
+		m.size.snapshot = msg.snapshot
+		m.clampSizeExplorerOffset()
+		return m, nil
+
+	case sessionsLoadedMsg:
+		m.sessions.loading = false
+		m.sessions.err = msg.err
+		m.sessions.snapshot = msg.snapshot
+		m.syncSessionExplorerViewport()
+		return m, nil
+
+	case migratePreflightLoadedMsg:
+		m.migratePreflight.loading = false
+		m.migratePreflight.source = msg.source
+		m.migratePreflight.target = msg.target
+		m.migratePreflight.diff = msg.diff
+		m.migratePreflight.err = msg.err
+		m.clampMigratePreflightOffset()
+		return m, nil
+
+	case schemaAttributePreflightLoadedMsg:
+		m.schemaAttributes.loading = false
+		m.schemaAttributes.plan = msg.plan
+		m.schemaAttributes.batchPlan = msg.batchPlan
+		m.schemaAttributes.err = msg.err
+		m.clampSchemaAttributeOffset()
+		return m, nil
+
+	case schemaAttributeSchemasLoadedMsg:
+		m.schemaAttributes.selectorLoading = false
+		m.schemaAttributes.schemas = msg.schemas
+		m.schemaAttributes.selectorErr = errorText(msg.err)
+		return m, nil
+
+	case schemaAttributeTablesLoadedMsg:
+		m.schemaAttributes.selectorLoading = false
+		m.schemaAttributes.tables = msg.tables
+		m.schemaAttributes.selectorErr = errorText(msg.err)
+		return m, nil
+
+	case schemaAttributeColumnsLoadedMsg:
+		m.schemaAttributes.selectorLoading = false
+		m.schemaAttributes.columns = msg.columns
+		m.schemaAttributes.selectorErr = errorText(msg.err)
+		if msg.err == nil && m.step == stepSchemaAttributeForm && len(msg.columns) > 0 {
+			m.schemaAttributes.columnIdx = 0
+			if m.schemaAttributes.selectedColumns == nil {
+				m.schemaAttributes.selectedColumns = map[string]bool{msg.columns[0]: true}
+			}
+			if m.schemaAttributes.selectedColumns != nil {
+				for index, column := range msg.columns {
+					if m.schemaAttributes.selectedColumns[column] {
+						m.schemaAttributes.columnIdx = index
+						break
+					}
+				}
+			}
+			m.schemaAttributes.inputs[2].SetValue(msg.columns[m.schemaAttributes.columnIdx])
+			m.schemaAttributes.targetEditing = false
+			m.schemaAttributes.workspace = true
+			m.schemaAttributes.actionMenu = false
+			m.schemaAttributes.focused = schemaAttributeFocusNullable
+			m.schemaAttributes.resetRequestedChanges()
+			return m, m.startSchemaAttributeCurrentLoad()
+		}
+		return m, nil
+
+	case schemaAttributeSearchLoadedMsg:
+		m.schemaAttributes.searchLoading = false
+		m.schemaAttributes.searchResults = msg.results
+		m.schemaAttributes.searchErr = errorText(msg.err)
+		m.schemaAttributes.guidedIdx = 0
+		return m, nil
+
+	case schemaAttributeCurrentLoadedMsg:
+		if len(m.schemaAttributes.inputs) < 3 || msg.schema != strings.TrimSpace(m.schemaAttributes.inputs[0].Value()) || msg.table != strings.TrimSpace(m.schemaAttributes.inputs[1].Value()) || msg.column != strings.TrimSpace(m.schemaAttributes.inputs[2].Value()) {
+			return m, nil
+		}
+		m.schemaAttributes.currentLoading = false
+		m.schemaAttributes.current = msg.metadata
+		m.schemaAttributes.currentErr = errorText(msg.err)
+		m.clampSchemaAttributeOffset()
+		return m, nil
+
+	case schemaAttributeApplyFinishedMsg:
+		m.schemaAttributes.applying = false
+		m.schemaAttributes.plan = msg.plan
+		m.schemaAttributes.batchPlan = msg.batchPlan
+		m.schemaAttributes.err = msg.err
+		if msg.err != nil {
+			m.step = stepSchemaAttributeResult
+			return m, nil
+		}
+		if len(m.schemaAttributes.inputs) < 3 {
+			m.step = stepSchemaAttributeResult
+			return m, nil
+		}
+		m.schemaAttributes.resetRequestedChanges()
+		m.schemaAttributes.notice = "Applied successfully. Current attributes were refreshed; choose another change or press N for the next column."
+		m.step = stepSchemaAttributeForm
+		if m.schemaAttributes.guidedStep != schemaGuidedAdvanced {
+			m.schemaAttributes.guidedStep = schemaGuidedChooseIntent
+			m.schemaAttributes.guidedIdx = 0
+			m.schemaAttributes.search.SetValue("")
+			m.schemaAttributes.searchResults = nil
+			return m, nil
+		}
+		return m, m.startSchemaAttributeCurrentLoad()
+
 	case tea.KeyMsg:
 		switch m.step {
 		case stepSelectMode:
@@ -281,6 +514,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 		case stepMigrateSelectDest:
 			return m.updateMigrateDestSelector(msg)
+		case stepMigratePreflight:
+			return m.updateMigratePreflight(msg)
 		case stepMigrateConfirm:
 			return m.updateMigrateConfirm(msg)
 		case stepMigrateResult:
@@ -294,6 +529,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				m.migrateProgressText = ""
 				m.step = stepSelectMode
 			}
+		case stepSelectCatalog:
+			return m.updateCatalogSelector(msg)
+		case stepPITRDashboard:
+			return m.updatePITRDashboard(msg)
+		case stepPITRRestoreTarget:
+			return m.updatePITRRestoreTarget(msg)
+		case stepPITRRecoveryPlan:
+			return m.updatePITRRecoveryPlan(msg)
+		case stepHealthDashboard:
+			return m.updateHealthDashboard(msg)
+		case stepSizeExplorer:
+			return m.updateSizeExplorer(msg)
+		case stepSessionExplorer:
+			return m.updateSessionExplorer(msg)
+		case stepSessionActionPlan:
+			return m.updateSessionActionPlan(msg)
+		case stepFlows:
+			return m.updateFlows(msg)
+		case stepSchemaAttributeForm:
+			return m.updateSchemaAttributeForm(msg)
+		case stepSchemaAttributePreflight:
+			return m.updateSchemaAttributePreflight(msg)
+		case stepSchemaAttributeConfirm:
+			return m.updateSchemaAttributeConfirm(msg)
+		case stepSchemaAttributeResult:
+			return m.updateSchemaAttributeResult(msg)
 		}
 		// Propagate input updates for active textinput in dump output path
 		if m.step == stepDumpOutputPath {
@@ -327,6 +588,14 @@ func (m Model) updateProfileSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.profileIdx < len(m.profiles)-1 {
 			m.profileIdx++
 		}
+	case "pgup":
+		m.profileIdx = m.profileSelectorPageIndex(-1)
+	case "pgdown":
+		m.profileIdx = m.profileSelectorPageIndex(1)
+	case "home":
+		m.profileIdx = 0
+	case "end":
+		m.profileIdx = len(m.profiles) - 1
 	case "enter", " ":
 		m.result.Profile = m.profiles[m.profileIdx]
 		if m.result.Mode == ModeDump {
@@ -339,6 +608,15 @@ func (m Model) updateProfileSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.migrateDestIdx = 1
 			}
 			m.step = stepMigrateSelectDest
+		} else if m.result.Mode == ModePITR {
+			m.refreshPITRDashboard()
+			m.step = stepPITRDashboard
+		} else if m.result.Mode == ModeHealth {
+			m.step = stepHealthDashboard
+			return m, m.startHealthRefresh()
+		} else if m.result.Mode == ModeSchemaAttributes {
+			m.step = stepSchemaAttributeForm
+			return m, m.startSchemaAttributeForm()
 		} else {
 			m.step = stepSelectFile
 		}
@@ -356,6 +634,7 @@ func (m Model) updateProfileSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "esc":
 		m.step = stepSelectMode
 	}
+	m.syncProfileSelectorViewport()
 	return m, nil
 }
 
@@ -471,6 +750,9 @@ func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 	}
+	if m.updateConfirmationReviewScroll(restoreConfirmationReview, msg) {
+		return m, nil
+	}
 
 	switch msg.String() {
 	case "enter", "y":
@@ -566,6 +848,7 @@ func (m Model) updateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openFilterInput("exclude-schema")
 		return m, m.filterInput.Focus()
 	}
+	m.clampConfirmationReviewOffset(restoreConfirmationReview)
 	return m, nil
 }
 
@@ -635,12 +918,42 @@ func (m Model) View() string {
 		return m.viewDumpResult()
 	case stepMigrateSelectDest:
 		return m.viewMigrateDestSelector()
+	case stepMigratePreflight:
+		return m.viewMigratePreflight()
 	case stepMigrateConfirm:
 		return m.viewMigrateConfirm()
 	case stepMigrating:
 		return m.viewMigrating()
 	case stepMigrateResult:
 		return m.viewMigrateResult()
+	case stepSelectCatalog:
+		return m.viewCatalogSelector()
+	case stepPITRDashboard:
+		return m.viewPITRDashboard()
+	case stepPITRRestoreTarget:
+		return m.viewPITRRestoreTarget()
+	case stepPITRRecoveryPlan:
+		return m.viewPITRRecoveryPlan()
+	case stepHealthDashboard:
+		return m.viewHealthDashboard()
+	case stepSizeExplorer:
+		return m.viewSizeExplorer()
+	case stepSessionExplorer:
+		return m.viewSessionExplorer()
+	case stepSessionActionPlan:
+		return m.viewSessionActionPlan()
+	case stepFlows:
+		return m.viewFlows()
+	case stepSchemaAttributeForm:
+		return m.viewSchemaAttributeForm()
+	case stepSchemaAttributePreflight:
+		return m.viewSchemaAttributePreflight()
+	case stepSchemaAttributeConfirm:
+		return m.viewSchemaAttributeConfirm()
+	case stepSchemaAttributeApplying:
+		return m.viewSchemaAttributeApplying()
+	case stepSchemaAttributeResult:
+		return m.viewSchemaAttributeResult()
 	}
 	return ""
 }
@@ -682,6 +995,7 @@ func (m *Model) saveFilterInput() {
 	}
 
 	m.filterInputMode = false
+	m.clampConfirmationReviewOffsets()
 }
 
 func (m *Model) cancelFilterInput() {
@@ -843,36 +1157,15 @@ func renderRow(selected bool, content string) string {
 	return prefix + text
 }
 
-func renderBadge(label, bg string) string {
-	return lipgloss.NewStyle().
-		Foreground(lipgloss.Color("#000000")).
-		Background(lipgloss.Color(bg)).
-		Bold(true).
-		Padding(0, 1).
-		Render(label)
-}
-
 func (m Model) viewProfileSelector() string {
-	var body strings.Builder
-
-	body.WriteString(renderSectionTitle(profileSelectorPrompt(m.result.Mode)))
-	body.WriteString("\n\n")
-
 	if len(m.profiles) == 0 {
-		body.WriteString(renderCard(m.width, "No profiles found", warningStyle.Render("Press A to add a new connection profile.")))
-	} else {
-		body.WriteString(renderProfileRows(m.width, m.profiles, m.profileIdx, ""))
+		return renderScreenFrame(m.width, "Select Connection Profile", profileSelectorSubtitle(m.result.Mode), renderCard(m.width, "No profiles found", warningStyle.Render("Press A to add a new connection profile.")), []keyHint{
+			{Key: "A", Label: "add"},
+			{Key: "Esc", Label: "back", Danger: true},
+			{Key: "Q", Label: "quit", Danger: true},
+		})
 	}
-
-	return renderScreenFrame(m.width, "Select Connection Profile", profileSelectorSubtitle(m.result.Mode), body.String(), []keyHint{
-		{Key: "↑/↓", Label: "navigate"},
-		{Key: "Enter", Label: "select"},
-		{Key: "A", Label: "add"},
-		{Key: "E", Label: "edit"},
-		{Key: "D", Label: "delete"},
-		{Key: "Esc", Label: "back", Danger: true},
-		{Key: "Q", Label: "quit", Danger: true},
-	})
+	return m.profileSelectorDocument().render()
 }
 
 func profileSelectorPrompt(mode Mode) string {
@@ -881,6 +1174,10 @@ func profileSelectorPrompt(mode Mode) string {
 		return "Choose a source profile to dump"
 	case ModeMigrate:
 		return "Choose a source profile to migrate"
+	case ModePITR:
+		return "Choose a PostgreSQL profile for PITR"
+	case ModeHealth:
+		return "Choose a PostgreSQL profile for health"
 	default:
 		return "Choose a target profile to restore into"
 	}
@@ -892,6 +1189,10 @@ func profileSelectorSubtitle(mode Mode) string {
 		return "Source database for backup export"
 	case ModeMigrate:
 		return "Source database for profile-to-profile copy"
+	case ModePITR:
+		return "Review PITR readiness and recovery plans"
+	case ModeHealth:
+		return "Review a read-only database health snapshot"
 	default:
 		return "Target database for dump restore"
 	}
@@ -959,7 +1260,7 @@ func (m Model) viewFileBrowser() string {
 	return renderScreenFrame(m.width, "Select Dump File", "Choose a dump artifact for restore", body.String(), hints)
 }
 
-func (m Model) viewConfirm() string {
+func (m Model) restoreConfirmContentLines() []string {
 	var body strings.Builder
 	p := m.result.Profile
 	s := m.result.Settings
@@ -1004,15 +1305,12 @@ func (m Model) viewConfirm() string {
 		body.WriteString(renderCard(m.width, "Safety Review", renderDanger("Clean mode may drop database objects before restore.")))
 	}
 
-	return renderScreenFrame(m.width, "Confirm Restore", "Pre-flight review before database restore", body.String(), []keyHint{
-		{Key: "C", Label: "clean"},
-		{Key: "M", Label: "create-db"},
-		{Key: "O", Label: "optimize"},
-		{Key: "+/-", Label: "jobs"},
-		{Key: "T/H", Label: "filters"},
-		{Key: "Enter", Label: "proceed"},
-		{Key: "Esc", Label: "back", Danger: true},
-	})
+	return strings.Split(body.String(), "\n")
+}
+
+func (m Model) viewConfirm() string {
+	lines := m.restoreConfirmContentLines()
+	return m.confirmationReviewViewport(restoreConfirmationReview, lines).Render(lines)
 }
 
 // --- Helpers ---
@@ -1268,7 +1566,7 @@ func (m Model) saveProfileForm() (tea.Model, tea.Cmd) {
 		delete(m.cfg.Profiles, m.origName)
 	}
 
-	m.cfg.Profiles[name] = config.Profile{
+	profile := config.Profile{
 		Driver:   driver,
 		Host:     host,
 		Port:     portInt,
@@ -1277,6 +1575,11 @@ func (m Model) saveProfileForm() (tea.Model, tea.Cmd) {
 		Database: dbName,
 		Runtime:  runtime,
 	}
+	if err := config.StoreProfilePassword(name, &profile); err != nil {
+		m.formErr = fmt.Sprintf("Failed to store password: %v", err)
+		return m, nil
+	}
+	m.cfg.Profiles[name] = profile
 
 	if err := config.SaveConfig(m.cfg); err != nil {
 		m.formErr = fmt.Sprintf("Failed to save config: %v", err)
@@ -1555,6 +1858,7 @@ func (m *Model) finalizeRestore(err error) {
 	if err != nil {
 		_ = beeep.Notify("DBTool Restore Failed", fmt.Sprintf("Profile: %s\nError: %v", m.result.Profile.Name, err), "")
 	} else {
+		m.recordCurrentFlow()
 		_ = beeep.Notify("DBTool Restore Success", fmt.Sprintf("Database %s restored successfully", m.result.Profile.Database), "")
 
 		// Post-restore optimization
@@ -1610,30 +1914,27 @@ func (m Model) viewRestoreResult() string {
 }
 
 func (m Model) updateSelectMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
-	switch msg.String() {
-	case "r", "R", "1":
-		m.result.Mode = ModeRestore
-		if m.hasActiveProfile() {
-			m.step = stepSelectFile
-		} else {
-			m.step = stepSelectProfile
+	key := msg.String()
+	switch key {
+	case "up", "k":
+		m.operationIdx = clampIndex(m.operationIdx-1, len(operationMenuItems))
+		return m, nil
+	case "down", "j":
+		m.operationIdx = clampIndex(m.operationIdx+1, len(operationMenuItems))
+		return m, nil
+	case "home":
+		m.operationIdx = 0
+		return m, nil
+	case "end":
+		m.operationIdx = len(operationMenuItems) - 1
+		return m, nil
+	case "enter", " ":
+		return m.startSelectedOperation()
+	case "f", "F":
+		if err := m.loadFlows(); err != nil {
+			m.flowErr = err.Error()
 		}
-	case "d", "D", "2":
-		m.result.Mode = ModeDump
-		if m.hasActiveProfile() {
-			m.dumpOutputInput.SetValue("")
-			m.dumpOutputInput.Focus()
-			m.step = stepDumpOutputPath
-		} else {
-			m.step = stepSelectProfile
-		}
-	case "m", "M", "3":
-		m.result.Mode = ModeMigrate
-		if m.hasActiveProfile() {
-			m.step = stepMigrateSelectDest
-		} else {
-			m.step = stepSelectProfile
-		}
+		m.step = stepFlows
 	case "p", "P":
 		if m.profileIdx >= len(m.profiles) {
 			m.profileIdx = 0
@@ -1648,6 +1949,10 @@ func (m Model) updateSelectMode(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "q", "ctrl+c", "esc":
 		return m, tea.Quit
 	}
+	if operationIdx, ok := operationIndexForKey(key); ok {
+		m.operationIdx = operationIdx
+		return m.startSelectedOperation()
+	}
 	return m, nil
 }
 
@@ -1660,33 +1965,7 @@ func (m Model) hasActiveProfile() bool {
 }
 
 func (m Model) viewSelectMode() string {
-	var body strings.Builder
-
-	if m.hasActiveProfile() {
-		p := m.result.Profile
-		body.WriteString(renderProfileSummaryCard(m.width, "Active Profile", p.Name, p.Driver, p.Host, p.Port, p.Database, p.User))
-		body.WriteString("\n\n")
-	}
-
-	body.WriteString(renderSectionTitle("Choose an operation"))
-	body.WriteString("\n\n")
-	body.WriteString(renderOperationCard(m.width, "R", "Restore", "TARGET DB", "Import a dump file into a database"))
-	body.WriteString("\n")
-	body.WriteString(renderOperationCard(m.width, "D", "Dump", "BACKUP", "Export a database to a dump file"))
-	body.WriteString("\n")
-	body.WriteString(renderOperationCard(m.width, "M", "Migrate", "SRC → DST", "Copy a database between profiles"))
-
-	profileLabel := "choose profile"
-	if m.hasActiveProfile() {
-		profileLabel = "switch profile"
-	}
-	return renderScreenFrame(m.width, "Select Operation", "Dark Database Command Center", body.String(), []keyHint{
-		{Key: "R", Label: "restore"},
-		{Key: "D", Label: "dump"},
-		{Key: "M", Label: "migrate"},
-		{Key: "P", Label: profileLabel},
-		{Key: "Q", Label: "quit", Danger: true},
-	})
+	return renderScreenFrame(m.width, "Select Operation", "Choose a workflow. Arrow keys move; Enter opens.", m.renderOperationMenuBody(), m.operationMenuFooterHints())
 }
 
 // ─── Profile selector: route to correct next step based on mode ─────────────
@@ -1752,6 +2031,9 @@ func (m Model) updateDumpConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, cmd
 		}
 	}
+	if m.updateConfirmationReviewScroll(dumpConfirmationReview, msg) {
+		return m, nil
+	}
 
 	switch msg.String() {
 	case "enter", "y":
@@ -1792,6 +2074,8 @@ func (m Model) updateDumpConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "n", "q", "ctrl+c", "esc":
 		m.step = stepDumpOutputPath
+	case "b", "B":
+		return m, m.openCatalogSelector()
 	case "t":
 		m.openFilterInput("include-table")
 		return m, m.filterInput.Focus()
@@ -1805,10 +2089,11 @@ func (m Model) updateDumpConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openFilterInput("exclude-schema")
 		return m, m.filterInput.Focus()
 	}
+	m.clampConfirmationReviewOffset(dumpConfirmationReview)
 	return m, nil
 }
 
-func (m Model) viewDumpConfirm() string {
+func (m Model) dumpConfirmContentLines() []string {
 	var body strings.Builder
 	format := m.result.DumpSettings.Format
 	if format == "" {
@@ -1826,11 +2111,12 @@ func (m Model) viewDumpConfirm() string {
 	body.WriteString("\n")
 	body.WriteString(renderCard(m.width, "Dump Options", renderFilterRows(s.IncludeSchema, s.ExcludeSchema, s.IncludeTable, s.ExcludeTable)))
 
-	return renderScreenFrame(m.width, "Confirm Dump", "Pre-flight review before exporting source database", body.String(), []keyHint{
-		{Key: "Enter/Y", Label: "dump"},
-		{Key: "T/H", Label: "filters"},
-		{Key: "Esc", Label: "back", Danger: true},
-	})
+	return strings.Split(body.String(), "\n")
+}
+
+func (m Model) viewDumpConfirm() string {
+	lines := m.dumpConfirmContentLines()
+	return m.confirmationReviewViewport(dumpConfirmationReview, lines).Render(lines)
 }
 
 // ─── Dumping ─────────────────────────────────────────────────────────────────
@@ -1883,6 +2169,7 @@ func (m *Model) finalizeDump(err error) {
 	if err != nil {
 		_ = beeep.Notify("DBTool Dump Failed", fmt.Sprintf("Profile: %s\nError: %v", m.result.Profile.Name, err), "")
 	} else {
+		m.recordCurrentFlow()
 		_ = beeep.Notify("DBTool Dump Success", fmt.Sprintf("Database %s dumped to %s", m.result.Profile.Database, m.result.DumpFile), "")
 	}
 }
@@ -1925,42 +2212,39 @@ func (m Model) updateMigrateDestSelector(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.migrateDestIdx < len(m.profiles)-1 {
 			m.migrateDestIdx++
 		}
+	case "pgup":
+		m.migrateDestIdx = m.migrateDestSelectorPageIndex(-1)
+	case "pgdown":
+		m.migrateDestIdx = m.migrateDestSelectorPageIndex(1)
+	case "home":
+		m.migrateDestIdx = 0
+	case "end":
+		m.migrateDestIdx = len(m.profiles) - 1
 	case "enter", " ":
 		candidate := m.profiles[m.migrateDestIdx]
 		if candidate.Name == m.result.Profile.Name {
 			return m, nil
 		}
 		m.result.DestProfile = candidate
-		m.step = stepMigrateConfirm
+		m.step = stepMigratePreflight
+		return m, m.startMigratePreflight()
 	case "q", "ctrl+c":
 		return m, tea.Quit
 	case "esc":
 		m.step = stepSelectProfile
 	}
+	m.syncMigrateDestSelectorViewport()
 	return m, nil
 }
 
 func (m Model) viewMigrateDestSelector() string {
-	var body strings.Builder
-
-	src := m.result.Profile
-	body.WriteString(renderProfileSummaryCard(m.width, "Source Profile", src.Name, src.Driver, src.Host, src.Port, src.Database, src.User))
-	body.WriteString("\n\n")
-	body.WriteString(renderSectionTitle("Choose a destination profile"))
-	body.WriteString("\n\n")
-
 	if len(m.profiles) == 0 {
-		body.WriteString(renderCard(m.width, "No profiles found", warningStyle.Render("Add another profile before migrating.")))
-	} else {
-		body.WriteString(renderProfileRows(m.width, m.profiles, m.migrateDestIdx, src.Name))
+		return renderScreenFrame(m.width, "Select Destination Profile", "Target database for profile-to-profile copy", renderCard(m.width, "No profiles found", warningStyle.Render("Add another profile before migrating.")), []keyHint{
+			{Key: "Esc", Label: "back", Danger: true},
+			{Key: "Q", Label: "quit", Danger: true},
+		})
 	}
-
-	return renderScreenFrame(m.width, "Select Destination Profile", "Target database for profile-to-profile copy", body.String(), []keyHint{
-		{Key: "↑/↓", Label: "navigate"},
-		{Key: "Enter", Label: "select"},
-		{Key: "Esc", Label: "back", Danger: true},
-		{Key: "Q", Label: "quit", Danger: true},
-	})
+	return m.migrateDestSelectorDocument().render()
 }
 
 // ─── Migrate: confirm ────────────────────────────────────────────────────────
@@ -1980,6 +2264,9 @@ func (m Model) updateMigrateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.filterInput, cmd = m.filterInput.Update(msg)
 			return m, cmd
 		}
+	}
+	if m.updateConfirmationReviewScroll(migrateConfirmationReview, msg) {
+		return m, nil
 	}
 
 	switch msg.String() {
@@ -2050,6 +2337,8 @@ func (m Model) updateMigrateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 
 	case "n", "q", "ctrl+c", "esc":
 		m.step = stepMigrateSelectDest
+	case "b", "B":
+		return m, m.openCatalogSelector()
 	case "c", "C":
 		m.result.MigrateSettings.Clean = !m.result.MigrateSettings.Clean
 	case "m", "M":
@@ -2079,10 +2368,11 @@ func (m Model) updateMigrateConfirm(msg tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.openFilterInput("exclude-schema")
 		return m, m.filterInput.Focus()
 	}
+	m.clampConfirmationReviewOffset(migrateConfirmationReview)
 	return m, nil
 }
 
-func (m Model) viewMigrateConfirm() string {
+func (m Model) migrateConfirmContentLines() []string {
 	var body strings.Builder
 	src := m.result.Profile
 	dst := m.result.DestProfile
@@ -2139,15 +2429,12 @@ func (m Model) viewMigrateConfirm() string {
 	}
 	body.WriteString(renderCard(m.width, "Safety Review", safety))
 
-	return renderScreenFrame(m.width, "Confirm Migrate", "Review source and target before copying data", body.String(), []keyHint{
-		{Key: "C", Label: "clean"},
-		{Key: "M", Label: "create-db"},
-		{Key: "S/A", Label: "mode"},
-		{Key: "O", Label: "optimize"},
-		{Key: "T/H", Label: "filters"},
-		{Key: "Enter", Label: "proceed"},
-		{Key: "Esc", Label: "back", Danger: true},
-	})
+	return strings.Split(body.String(), "\n")
+}
+
+func (m Model) viewMigrateConfirm() string {
+	lines := m.migrateConfirmContentLines()
+	return m.confirmationReviewViewport(migrateConfirmationReview, lines).Render(lines)
 }
 
 // ─── Migrating (2-phase progress) ─────────────────────────────────────────────
@@ -2288,6 +2575,7 @@ func (m *Model) finalizeMigrate(err error) {
 		m.migrateErr = err
 		_ = beeep.Notify("DBTool Migrate Failed", fmt.Sprintf("%s -> %s: %v", src.Name, dst.Name, err), "")
 	} else {
+		m.recordCurrentFlow()
 		_ = beeep.Notify("DBTool Migrate Success", fmt.Sprintf("%s -> %s migrated", src.Database, dst.Database), "")
 
 		// Post-migrate optimization on target

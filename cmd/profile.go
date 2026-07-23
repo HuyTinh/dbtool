@@ -10,12 +10,14 @@ import (
 )
 
 var (
-	profileHost     string
-	profilePort     int
-	profileUser     string
-	profileDatabase string
-	profilePassword string
-	profileDriver   string
+	profileHost                 string
+	profilePort                 int
+	profileUser                 string
+	profileDatabase             string
+	profilePassword             string
+	profileDriver               string
+	profileRestoreDrillSandbox  bool
+	profileMigrateSecretsDryRun bool
 )
 
 var profileCmd = &cobra.Command{
@@ -35,12 +37,13 @@ var profileAddCmd = &cobra.Command{
 		}
 
 		p := config.Profile{
-			Driver:   profileDriver,
-			Host:     profileHost,
-			Port:     profilePort,
-			User:     profileUser,
-			Database: profileDatabase,
-			Password: profilePassword,
+			Driver:              profileDriver,
+			Host:                profileHost,
+			Port:                profilePort,
+			User:                profileUser,
+			Database:            profileDatabase,
+			Password:            profilePassword,
+			RestoreDrillSandbox: profileRestoreDrillSandbox,
 		}
 
 		if err := cfg.SaveProfile(name, p); err != nil {
@@ -76,6 +79,37 @@ var profileListCmd = &cobra.Command{
 	},
 }
 
+var profileMigrateSecretsCmd = &cobra.Command{
+	Use:   "migrate-secrets",
+	Short: "Move plaintext profile passwords into secure storage",
+	RunE: func(cmd *cobra.Command, args []string) error {
+		cfg, err := config.LoadConfig()
+		if err != nil {
+			return err
+		}
+
+		if profileMigrateSecretsDryRun {
+			fmt.Printf("Would migrate %d plaintext profile password(s).\n", config.PendingProfileSecretMigrations(cfg))
+			return nil
+		}
+
+		migrated, err := config.MigrateProfileSecrets(cfg)
+		if err != nil {
+			return fmt.Errorf("migrate profile secrets: %d profile password(s) stored before failure; profiles.yaml was not changed: %w", migrated, err)
+		}
+		if migrated == 0 {
+			fmt.Println("No plaintext profile passwords to migrate.")
+			return nil
+		}
+		if err := config.SaveConfig(cfg); err != nil {
+			return fmt.Errorf("save migrated profile secrets: %w", err)
+		}
+
+		fmt.Printf("✓ Migrated %d profile password(s) to secure storage.\n", migrated)
+		return nil
+	},
+}
+
 func init() {
 	profileAddCmd.Flags().StringVar(&profileDriver, "driver", "postgres", "Database engine driver (e.g. postgres)")
 	profileAddCmd.Flags().StringVar(&profileHost, "host", "localhost", "Host address")
@@ -83,10 +117,13 @@ func init() {
 	profileAddCmd.Flags().StringVar(&profileUser, "user", "postgres", "Database username")
 	profileAddCmd.Flags().StringVar(&profileDatabase, "db", "", "Database name")
 	profileAddCmd.Flags().StringVar(&profilePassword, "password", "", "Database password")
+	profileAddCmd.Flags().BoolVar(&profileRestoreDrillSandbox, "restore-drill-sandbox", false, "Explicitly allow this profile to be a destructive restore-drill target")
 
 	_ = profileAddCmd.MarkFlagRequired("db")
+	profileMigrateSecretsCmd.Flags().BoolVar(&profileMigrateSecretsDryRun, "dry-run", false, "Report plaintext profile passwords that would be migrated without changing storage")
 
 	profileCmd.AddCommand(profileAddCmd)
 	profileCmd.AddCommand(profileListCmd)
+	profileCmd.AddCommand(profileMigrateSecretsCmd)
 	RootCmd.AddCommand(profileCmd)
 }

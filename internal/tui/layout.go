@@ -7,11 +7,6 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-type screenSection struct {
-	Title string
-	Body  string
-}
-
 type keyHint struct {
 	Key    string
 	Label  string
@@ -33,21 +28,6 @@ const (
 	badgeWarning
 	badgeDanger
 )
-
-func renderScreen(title string, body string, footer string) string {
-	var sb strings.Builder
-	sb.WriteString(renderTitle(title))
-	sb.WriteString("\n\n")
-	sb.WriteString(body)
-	if footer != "" {
-		if !strings.HasSuffix(body, "\n") {
-			sb.WriteString("\n")
-		}
-		sb.WriteString("\n")
-		sb.WriteString(renderFooter(footer))
-	}
-	return sb.String()
-}
 
 func renderScreenFrame(width int, title, subtitle, body string, hints []keyHint) string {
 	var sb strings.Builder
@@ -89,10 +69,6 @@ func renderCommandBar(width int, items []keyHint) string {
 	}
 	bar := strings.Join(parts, "   ")
 	return footerStyle.Width(safePanelWidth(width)).Render(bar)
-}
-
-func renderPanel(width int, body string) string {
-	return panelStyle.Width(safePanelWidth(width)).Render(body)
 }
 
 func renderCard(width int, title string, body string) string {

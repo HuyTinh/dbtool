@@ -10,7 +10,7 @@
 
 ## Yêu cầu
 
-- **Go** 1.21 trở lên
+- **Go** 1.26.5 trở lên (phải tương thích với phiên bản khai báo trong `go.mod`)
 - **PostgreSQL client utilities** đã được cài đặt và thêm vào `PATH`:
   - `pg_dump` — dùng cho lệnh `dump`
   - `pg_restore` — dùng cho lệnh `restore` (với định dạng custom/directory)
@@ -50,6 +50,15 @@ Lệnh khả dụng:
     init      Tự động phát hiện kết nối từ file cấu hình dự án
   tui         Giao diện tương tác (chọn profile, file dump, restore/migrate)
   dump        Sao lưu CSDL ra file dump
+  backup      Xác minh, liệt kê và preview retention cho các dump artifact local
+    verify    Kiểm tra checksum sidecar của một dump artifact
+    list      Liệt kê dump artifact trong thư mục, mới nhất trước
+    retention-preview  Preview artifact cũ có thể được dọn theo count retention
+    restore-preflight  Đánh giá read-only khả năng restore của artifact
+    restore-drill      Restore và verify artifact trong sandbox đã opt-in
+  health      Chụp nhanh health snapshot read-only cho một profile CSDL
+  size        Khám phá kích thước table và index PostgreSQL, chỉ đọc
+  schema      So sánh schema và preview/apply thuộc tính column PostgreSQL
   restore     Khôi phục CSDL từ file dump
   migrate     Sao chép schema+dữ liệu từ profile A sang profile B
   inspect     Kiểm tra nội dung file dump (danh sách bảng, view)
@@ -70,6 +79,7 @@ Global flags:
   -q, --quiet            Tắt các output tiến trình, chỉ hiển thị lỗi
   -v, --verbose          In chi tiết log subprocess
       --timeout string   Giới hạn thời gian thực thi (vd: 2h, 45m, 15s)
+      --ask-pass         Nhập master password cho profile dùng encrypted fallback
   -h, --help             Hiển thị trợ giúp
 ```
 
@@ -105,6 +115,18 @@ dbtool profile add local-dev \
   --password secret
 ```
 
+**Profile sandbox cho restore drill:** chỉ đánh dấu một database recovery tách biệt mà bạn chấp nhận bị clean/rewrite.
+
+```bash
+dbtool profile add recovery-sandbox \
+  --db app_recovery_sandbox \
+  --host localhost \
+  --user postgres \
+  --restore-drill-sandbox
+```
+
+Không dùng `--restore-drill-sandbox` cho profile production, staging dùng chung, hoặc database có dữ liệu cần giữ. Flag này là opt-in bắt buộc trước khi `backup restore-drill --confirm` có thể ghi dữ liệu.
+
 **Liệt kê tất cả profile:**
 
 ```bash
@@ -117,6 +139,26 @@ NAME                 DRIVER     HOST:PORT                 USER            DATABA
 local-dev            postgres   localhost:5432            postgres        myapp_dev
 staging              postgres   10.0.0.5:5432             appuser         myapp_staging
 ```
+
+#### Lưu password an toàn và migration profile cũ
+
+Khi tạo hoặc import profile có password, `dbtool` ưu tiên lưu password trong OS keyring. Password không được ghi lại vào `profiles.yaml`. Nếu keyring không khả dụng, dùng `--ask-pass` để nhập master password cho encrypted fallback cục bộ.
+
+```bash
+# Tạo profile với OS keyring (mặc định)
+dbtool profile add local-dev --db myapp_dev --password secret
+
+# Nếu máy không có keyring, dùng encrypted fallback
+dbtool --ask-pass profile add local-dev --db myapp_dev --password secret
+
+# Kiểm tra profile legacy nào vẫn còn plaintext mà không ghi thay đổi
+dbtool profile migrate-secrets --dry-run
+
+# Migrate password plaintext của profile legacy
+dbtool --ask-pass profile migrate-secrets
+```
+
+Không commit `profiles.yaml`, keyring export, master password hoặc file `.env` vào Git. Khi migration không hoàn tất, `profiles.yaml` được giữ nguyên để có thể sửa nguyên nhân và chạy lại an toàn.
 
 **Tự động nhận diện kết nối từ file cấu hình dự án (`profile init`):**
 
@@ -158,12 +200,17 @@ dbtool tui
 | Chọn profile | `[a]` thêm, `[e]` sửa, `[d]` xóa, `[p]` đổi profile | Quản lý profile kết nối trực tiếp trong TUI. Profile đã chọn được ghi nhớ cho các thao tác tiếp theo. |
 | Duyệt file dump | `/` tìm kiếm, `[enter]` chọn, `[backspace]` quay lại | Duyệt thư mục, tìm file dump theo tên. Hỗ trợ filter để tìm nhanh. |
 | Xác nhận restore | `[c]` clean, `[m]` create-db, `[o]` optimize, `[t/T]` table, `[h/H]` schema | Xem lại cấu hình trước khi restore. Hỗ trợ nhập filter schema/table trực tiếp. |
-| Xác nhận dump | `[t]` inc-table, `[T]` exc-table, `[h]` inc-schema, `[H]` exc-schema | Xem lại cấu hình trước khi dump. Hỗ trợ nhập filter schema/table trực tiếp. |
-| Xác nhận migrate | `[c]` clean, `[m]` create-db, `[s]` schema-only, `[a]` data-only, `[o]` optimize, `[t/T]` table, `[h/H]` schema | Cấu hình migrate chi tiết. Hỗ trợ nhập filter schema/table trực tiếp. |
+| Xác nhận dump | `[b]` duyệt object, `[t]` inc-table, `[T]` exc-table, `[h]` inc-schema, `[H]` exc-schema | Với PostgreSQL, `[b]` mở danh sách schema/table để multi-select; vẫn hỗ trợ pattern text trực tiếp. |
+| Xác nhận migrate | `[b]` duyệt object, `[c]` clean, `[m]` create-db, `[s]` schema-only, `[a]` data-only, `[o]` optimize, `[t/T]` table, `[h/H]` schema | Với PostgreSQL, `[b]` chọn object trực quan từ profile nguồn; driver khác fallback về pattern text. |
+| Schema column attributes (PostgreSQL) | `[s]` mở editor; `[tab]` chọn control, `[space]/[enter]` đổi trạng thái, `[F5]` preflight | Chỉnh `NULL/NOT NULL`, `DEFAULT`, hoặc single-column `UNIQUE`. Schema → table → column là selector phụ thuộc, lọc theo chữ đang gõ. |
 | Chọn profile đích (migrate) | `[enter]` chọn | Chọn profile đích để migrate schema+dữ liệu. |
 | Đang restore/migrate | — | Thanh tiến trình và log realtime. |
 
 **Lưu ý an toàn trong TUI:** các thao tác restore/dump/migrate chỉ chạy sau màn hình xác nhận. Khi bật `clean`, TUI sẽ cảnh báo vì thao tác này có thể drop object trước khi restore/migrate. Xóa profile trong TUI chỉ xóa cấu hình profile local của dbtool, không xóa database thật.
+
+**Duyệt object PostgreSQL:** ở màn hình xác nhận dump hoặc migrate, nhấn `[b]`, dùng `[space]` để chọn, `[tab]` để đổi giữa schema/table, `[/]` để tìm và `[x]` để đổi include/exclude. Chọn table sẽ dùng tên đầy đủ `schema.table` và thay thế lựa chọn schema cùng chiều để tránh bộ lọc mơ hồ.
+
+**Schema editor PostgreSQL:** từ màn hình chọn thao tác, nhấn `[s]`, chọn profile rồi bắt đầu ở **Guided Field Change**. Chọn kết quả đời thường trước (`Make a field required`, `Allow a field to be left blank`, `Set/Remove automatic default value`, `Prevent duplicate values`), sau đó tìm field bằng một ô search như `customer email` hoặc `invoice total`. Chọn một kết quả `schema.table.column`, nhập default expression chỉ khi cần, rồi nhấn `[R]` để Review. Review tự chạy preflight đọc dữ liệu (`NULL`, duplicate và constraint hiện có); sau khi xem SQL/warning, `[A]` là xác nhận ghi DB duy nhất. Apply lấy `ACCESS EXCLUSIVE` table lock và chạy lại preflight trong transaction. `[X]` ở bước đầu mở **Advanced Table Workspace** cho người dùng cần duyệt schema/table/column kỹ thuật; đây không phải luồng mặc định. Primary key vẫn được bảo vệ, không thể thêm/xóa UNIQUE dư thừa trong v1.
 
 **Ví dụ luồng sử dụng:**
 
@@ -223,6 +270,111 @@ dbtool dump backup.tar --profile local-dev \
 > - **`custom`** (mặc định): Hỗ trợ nén, hỗ trợ restore theo bảng lẻ. Được khuyến nghị.
 > - **`plain`**: File SQL văn bản thuần, có thể mở và đọc bằng text editor.
 > - **`directory`**: Mỗi bảng là một file riêng biệt trong thư mục, hỗ trợ restore song song với `-j`.
+
+---
+
+### Backup catalog và verification (`backup`)
+
+Các lệnh trong nhóm này chỉ đọc metadata local; chúng không upload, tạo, sửa hoặc xóa dump artifact.
+
+```bash
+# Kiểm tra checksum sidecar được tạo sau dump
+dbtool backup verify ./backups/myapp.tar
+
+# Liệt kê artifact custom/directory/plain được hỗ trợ, mới nhất trước
+dbtool backup list ./backups
+
+# Preview các artifact cũ hơn số lượng cần giữ; không xóa file
+dbtool backup retention-preview ./backups --keep 5
+
+# Kiểm tra archive listability, checksum và target profile trước restore drill
+dbtool backup restore-preflight ./backups/myapp.dump --profile sandbox
+
+# JSON dành cho automation
+dbtool backup restore-preflight ./backups/myapp.dump --profile sandbox --output json
+
+# Chỉ preview restore drill (mặc định, không ghi database)
+dbtool backup restore-drill ./backups/myapp.dump --profile recovery-sandbox
+
+# Thực thi restore drill sau khi profile được opt-in rõ ràng
+dbtool backup restore-drill ./backups/myapp.dump --profile recovery-sandbox --confirm
+```
+
+`verify` báo `VALID` khi checksum sidecar khớp. Khi không có sidecar, lệnh báo `MISSING`: artifact vẫn được liệt kê nhưng chưa được kiểm chứng mật mã. `retention-preview` chỉ đưa danh sách candidate và dung lượng có thể giải phóng; không có command xóa artifact trong nhóm này. `restore-preflight` chỉ đọc artifact bằng `pg_restore --list` và kiểm tra read-only target connectivity; kết quả listability/checksum không phải bằng chứng recoverability.
+
+`restore-drill` yêu cầu artifact có checksum `VALID` và profile target được tạo với `--restore-drill-sandbox`; nếu thiếu một trong hai, lệnh từ chối chạy. Không có `--confirm`, lệnh chỉ in plan. Với `--confirm`, dbtool clean sandbox, restore artifact và chạy post-restore verification. Đây là thao tác phá huỷ dữ liệu trong sandbox; không dùng flag opt-in này cho production. Kết quả drill được ghi lịch sử với operation `restore-drill`.
+
+Sau dump thành công, dbtool tạo sidecar `*.dbtool-manifest.json` chứa checksum, format và inventory schema/table không bí mật. Restore drill mặc định dùng `--verification-policy basic`: artifact legacy không có manifest vẫn chạy với warning. Dùng `--verification-policy strict` để bắt buộc manifest có checksum khớp và table inventory; policy strict từ chối artifact legacy hoặc plain dump không có inventory.
+
+---
+
+### Database health snapshot (read-only)
+
+```bash
+# Terminal table dành cho người vận hành
+dbtool health --profile local-dev
+
+# JSON dành cho automation / monitoring
+dbtool health --profile local-dev --output json
+
+# Đánh dấu query chạy trên 90 giây là long-running
+dbtool health --profile local-dev --long-query-threshold 90s
+```
+
+Health snapshot không thay đổi database. Nó báo PostgreSQL version, connection latency, database size, session usage, idle-in-transaction session, long-running query và blocked session. Metrics mà role hiện tại không thể đọc được được hiển thị là `unavailable`; đây là cảnh báo capability, không phải kết luận database bị down.
+
+---
+
+### Database size explorer (read-only)
+
+```bash
+# Các relation/index lớn nhất trong profile
+dbtool size --profile local-dev
+
+# Giới hạn vào một schema và 10 kết quả
+dbtool size --profile local-dev --schema public --limit 10
+
+# JSON dành cho automation
+dbtool size --profile local-dev --output json
+```
+
+Size Explorer chỉ đọc PostgreSQL catalog. Nó hiển thị database size, table heap, index, TOAST và total relation size, cùng các index lớn nhất. `estimated_rows`/`Rows est.` là thống kê catalog, không phải `COUNT(*)` chính xác. Lệnh không chạy `ANALYZE`, `VACUUM` hoặc `REINDEX`.
+
+Trong TUI, mở Health Dashboard rồi nhấn `S` để vào Size Explorer; `R` refresh snapshot, `Esc` quay lại Health Dashboard.
+
+### PostgreSQL column attributes (`schema alter`)
+
+V1 hỗ trợ `NULL`/`NOT NULL`, `DEFAULT` và single-column `UNIQUE` cho PostgreSQL. Mặc định lệnh chỉ preflight: nó kiểm tra row `NULL` trước `NOT NULL`, kiểm tra nhóm giá trị trùng trước `UNIQUE`, rồi in đúng DDL sẽ chạy. Chỉ thêm `--apply` khi đã review plan.
+
+```bash
+# Preview: email bắt buộc có giá trị và là duy nhất; không thay đổi database
+dbtool schema alter --profile local-dev --schema public --table users --column email \
+  --nullable=false --unique=true
+
+# Thực thi cùng thay đổi trên; dbtool lock bảng, chạy lại preflight và chỉ sau đó apply
+dbtool schema alter --profile local-dev --schema public --table users --column email \
+  --nullable=false --unique=true --apply
+
+# Đặt hoặc bỏ DEFAULT (biểu thức PostgreSQL được giữ nguyên)
+dbtool schema alter --profile local-dev --schema public --table users --column status \
+  --default "'active'::text"
+dbtool schema alter --profile local-dev --schema public --table users --column status --drop-default --apply
+
+# Bỏ UNIQUE. Nếu có đúng một single-column UNIQUE, constraint được tự nhận diện.
+dbtool schema alter --profile local-dev --schema public --table users --column email --unique=false --apply
+```
+
+`--default` là biểu thức SQL PostgreSQL, không phải dữ liệu được escape tự động; luôn xem SQL preview. Lệnh từ chối apply khi preflight thấy dữ liệu vi phạm. Với `--apply`, preflight được chạy lại trong transaction sau `ACCESS EXCLUSIVE` table lock để tránh race giữa kiểm tra và thay đổi. `UNIQUE` composite, primary key, foreign key, check constraint và index độc lập chưa thuộc v1.
+
+### Session explorer (read-only)
+
+```bash
+dbtool sessions --profile local-dev
+dbtool sessions --profile local-dev --state active --limit 50
+dbtool sessions --profile local-dev --output json
+```
+
+Session Explorer chỉ đọc `pg_stat_activity` và blocker metadata. Query text cùng connection secret không được thu thập hoặc hiển thị; command này không cancel/terminate session. Trong TUI, mở Health Dashboard rồi nhấn `J`.
 
 ---
 

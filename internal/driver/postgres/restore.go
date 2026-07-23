@@ -320,7 +320,7 @@ func scanStream(r io.Reader, out chan driver.Progress, isStderr bool, totalCount
 
 	scanner := bufio.NewScanner(r)
 	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
-	
+
 	processed := 0
 	for scanner.Scan() {
 		line := scanner.Text()

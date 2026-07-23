@@ -10,6 +10,7 @@ type migrationFunc func(*Config) error
 
 var configMigrations = map[int]migrationFunc{
 	LegacyConfigVersion: migrateV0ToV1,
+	1:                   migrateV1ToV2,
 }
 
 type configVersionProbe struct {
@@ -34,6 +35,9 @@ func detectConfigVersion(data []byte) (int, error) {
 func migrateConfig(cfg *Config, from int) (bool, error) {
 	if cfg == nil {
 		cfg = &Config{}
+	}
+	if from > CurrentConfigVersion {
+		return false, fmt.Errorf("config version %d is newer than supported version %d", from, CurrentConfigVersion)
 	}
 
 	changed := false
@@ -61,5 +65,9 @@ func migrateV0ToV1(cfg *Config) error {
 	if cfg.Profiles == nil {
 		cfg.Profiles = make(map[string]Profile)
 	}
+	return nil
+}
+
+func migrateV1ToV2(cfg *Config) error {
 	return nil
 }

@@ -210,14 +210,8 @@ func ExecuteRestoreLogic(ctx context.Context, filePath string) error {
 		}
 	}
 
-	// 8. Attach Execution Timeout Context
-	// We create a root command object internally just to parse the timeout config safely
-	tempCmd := &cobra.Command{}
-	runCtx, cancel, err := ContextWithTimeout(tempCmd, ctx)
-	if err != nil {
-		return err
-	}
-	defer cancel()
+	// The command handler passes a timeout-aware context for the full workflow.
+	runCtx := ctx
 
 	// 9. Execute Restore Subprocess
 	progressChan, err := drv.Restore(runCtx, opts)
@@ -282,6 +276,7 @@ func ExecuteRestoreLogic(ctx context.Context, filePath string) error {
 		return lastProgress.Err
 	}
 	_ = beeep.Notify("DBTool Restore Success", fmt.Sprintf("Database %s restored successfully", profile.Database), "")
+	recordFlow(restoreFlow(profile.Name, filePath, string(finalFormat), restoreJobs, restoreClean, restoreCreateIfMissing, restoreOptimize, includeTable, excludeTable, includeSchema, excludeSchema))
 
 	fmt.Println("✓ Database restore completed successfully.")
 
@@ -325,7 +320,9 @@ var restoreCmd = &cobra.Command{
 	Short: "Restore a database from a dump archive or file",
 	Args:  cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
-		return ExecuteRestoreLogic(cmd.Context(), args[0])
+		return runWithTimeout(cmd, cmd.Context(), func(ctx context.Context) error {
+			return ExecuteRestoreLogic(ctx, args[0])
+		})
 	},
 }
 
@@ -355,8 +352,6 @@ func defaultJobs() int {
 	}
 	return n
 }
-
-
 
 func getDryRunCommand(opts driver.RestoreOptions) string {
 	if opts.Format == driver.FormatPlain {

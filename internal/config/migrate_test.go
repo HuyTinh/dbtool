@@ -31,8 +31,8 @@ profiles:
 	if err != nil {
 		t.Fatalf("detectConfigVersion: %v", err)
 	}
-	if version != CurrentConfigVersion {
-		t.Fatalf("version = %d, want %d", version, CurrentConfigVersion)
+	if version != 1 {
+		t.Fatalf("version = %d, want 1", version)
 	}
 }
 
@@ -71,6 +71,18 @@ func TestMigrateConfigReturnsErrorWhenStepMissing(t *testing.T) {
 		t.Fatalf("expected missing migration error")
 	}
 	if !strings.Contains(err.Error(), "missing config migration") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestMigrateConfigRejectsFutureVersion(t *testing.T) {
+	cfg := &Config{Version: CurrentConfigVersion + 1}
+
+	_, err := migrateConfig(cfg, CurrentConfigVersion+1)
+	if err == nil {
+		t.Fatal("expected newer config version to be rejected")
+	}
+	if !strings.Contains(err.Error(), "newer than supported") {
 		t.Fatalf("unexpected error: %v", err)
 	}
 }

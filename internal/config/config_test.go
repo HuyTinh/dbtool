@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -85,6 +86,24 @@ func TestProfileYAMLRuntimeRoundTrip(t *testing.T) {
 	}
 }
 
+func TestProfileYAMLLoadsRestoreDrillSandboxOptIn(t *testing.T) {
+	data := []byte(`driver: postgres
+host: localhost
+port: 5432
+user: postgres
+database: recovery
+restore_drill_sandbox: true
+`)
+
+	var profile Profile
+	if err := yaml.Unmarshal(data, &profile); err != nil {
+		t.Fatalf("unmarshal profile: %v", err)
+	}
+	if !profile.RestoreDrillSandbox {
+		t.Fatalf("restore drill sandbox opt-in was not loaded: %#v", profile)
+	}
+}
+
 func TestLoadConfigLegacyVersionlessFileDefaultsToCurrentVersion(t *testing.T) {
 	configDir := filepath.Join(t.TempDir(), "AppData", "Roaming")
 	t.Setenv("APPDATA", configDir)
@@ -152,7 +171,7 @@ func TestSaveConfigWritesCurrentVersion(t *testing.T) {
 	if err != nil {
 		t.Fatalf("read saved config: %v", err)
 	}
-	if !strings.Contains(string(data), "version: 1") {
-		t.Fatalf("saved config missing version header:\n%s", string(data))
+	if !strings.Contains(string(data), "version: "+strconv.Itoa(CurrentConfigVersion)) {
+		t.Fatalf("saved config missing current version header:\n%s", string(data))
 	}
 }
